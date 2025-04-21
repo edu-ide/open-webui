@@ -188,6 +188,7 @@
 							<option value="">{$i18n.t('Whisper (Local)')}</option>
 							<option value="openai">OpenAI</option>
 							<option value="web">{$i18n.t('Web API')}</option>
+							<option value="whisper-live">{$i18n.t('Whisper-Live')}</option>
 							<option value="deepgram">Deepgram</option>
 							<option value="azure">Azure AI Speech</option>
 						</select>
