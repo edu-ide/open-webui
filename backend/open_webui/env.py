@@ -436,7 +436,7 @@ else:
         )
     except Exception:
         AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER_DATA = 10
-
+DEMO_INTERNAL_API_BASE_URL = os.environ.get("DEMO_INTERNAL_API_BASE_URL", "localhost:8081")
 ####################################
 # OFFLINE_MODE
 ####################################
