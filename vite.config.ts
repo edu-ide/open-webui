@@ -1,5 +1,6 @@
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
+import path from 'path';
 
 import { viteStaticCopy } from 'vite-plugin-static-copy';
 
@@ -17,27 +18,47 @@ import { viteStaticCopy } from 'vite-plugin-static-copy';
 // 	}
 // };
 
-export default defineConfig({
-	plugins: [
-		sveltekit(),
-		viteStaticCopy({
-			targets: [
-				{
-					src: 'node_modules/onnxruntime-web/dist/*.jsep.*',
+export default defineConfig(({ command, mode }) => {
+	const isSsrBuild = command === 'build' && process.env.SSR === 'true';
 
-					dest: 'wasm'
-				}
-			]
-		})
-	],
-	define: {
-		APP_VERSION: JSON.stringify(process.env.npm_package_version),
-		APP_BUILD_HASH: JSON.stringify(process.env.APP_BUILD_HASH || 'dev-build')
-	},
-	build: {
-		sourcemap: true
-	},
-	worker: {
-		format: 'es'
-	}
+	return {
+		plugins: [
+			sveltekit(),
+			viteStaticCopy({
+				targets: [
+					{
+						src: 'node_modules/onnxruntime-web/dist/*.jsep.*',
+						dest: 'wasm'
+					}
+				]
+			})
+		],
+		server: {
+			fs: {
+				allow: [path.resolve(__dirname, 'dist')]
+			},
+			headers: {
+				'Cross-Origin-Opener-Policy': 'same-origin',
+				'Cross-Origin-Embedder-Policy': 'require-corp',
+				'Cross-Origin-Resource-Policy': 'cross-origin'
+			}
+		},
+		preview: {
+			headers: {
+				'Cross-Origin-Opener-Policy': 'same-origin',
+				'Cross-Origin-Embedder-Policy': 'require-corp',
+				'Cross-Origin-Resource-Policy': 'cross-origin'
+			}
+		},
+		define: {
+			APP_VERSION: JSON.stringify(process.env.npm_package_version),
+			APP_BUILD_HASH: JSON.stringify(process.env.APP_BUILD_HASH || 'dev-build')
+		},
+		build: {
+			sourcemap: true
+		},
+		worker: {
+			format: 'es'
+		}
+	};
 });
