@@ -44,6 +44,20 @@ from open_webui.env import (
     ENABLE_FORWARD_USER_INFO_HEADERS,
 )
 
+# Import the handlers
+from open_webui.audio_handlers import (
+    handle_local_stt,
+    handle_openai_stt,
+    handle_deepgram_stt,
+    handle_azure_stt,
+)
+# Import the new audio utility functions
+from open_webui.utils.audio_utils import (
+    get_audio_format,
+    convert_audio_to_wav,
+    set_faster_whisper_model,
+)
+
 
 router = APIRouter()
 
@@ -62,63 +76,13 @@ SPEECH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 ##########################################
 #
-# Utility functions
+# Utility functions (MOVED to audio_utils.py)
 #
 ##########################################
 
-from pydub import AudioSegment
-from pydub.utils import mediainfo
-
-
-def get_audio_format(file_path):
-    """Check if the given file needs to be converted to a different format."""
-    if not os.path.isfile(file_path):
-        log.error(f"File not found: {file_path}")
-        return False
-
-    info = mediainfo(file_path)
-    if (
-        info.get("codec_name") == "aac"
-        and info.get("codec_type") == "audio"
-        and info.get("codec_tag_string") == "mp4a"
-    ):
-        return "mp4"
-    elif info.get("format_name") == "ogg":
-        return "ogg"
-    elif info.get("format_name") == "matroska,webm":
-        return "webm"
-    return None
-
-
-def convert_audio_to_wav(file_path, output_path, conversion_type):
-    """Convert MP4/OGG audio file to WAV format."""
-    audio = AudioSegment.from_file(file_path, format=conversion_type)
-    audio.export(output_path, format="wav")
-    log.info(f"Converted {file_path} to {output_path}")
-
-
-def set_faster_whisper_model(model: str, auto_update: bool = False):
-    whisper_model = None
-    if model:
-        from faster_whisper import WhisperModel
-
-        faster_whisper_kwargs = {
-            "model_size_or_path": model,
-            "device": DEVICE_TYPE if DEVICE_TYPE and DEVICE_TYPE == "cuda" else "cpu",
-            "compute_type": "int8",
-            "download_root": WHISPER_MODEL_DIR,
-            "local_files_only": not auto_update,
-        }
-
-        try:
-            whisper_model = WhisperModel(**faster_whisper_kwargs)
-        except Exception:
-            log.warning(
-                "WhisperModel initialization failed, attempting download with local_files_only=False"
-            )
-            faster_whisper_kwargs["local_files_only"] = False
-            whisper_model = WhisperModel(**faster_whisper_kwargs)
-    return whisper_model
+# def get_audio_format(file_path): ...
+# def convert_audio_to_wav(file_path, output_path, conversion_type=None): ...
+# def set_faster_whisper_model(model: str, auto_update: bool = False): ...
 
 
 ##########################################
@@ -211,10 +175,17 @@ async def update_audio_config(
     request.app.state.config.AUDIO_STT_AZURE_REGION = form_data.stt.AZURE_REGION
     request.app.state.config.AUDIO_STT_AZURE_LOCALES = form_data.stt.AZURE_LOCALES
 
+    # Update whisper model if engine is local ('')
     if request.app.state.config.STT_ENGINE == "":
+        log.info("STT Engine is local ('Faster-Whisper'), (re)loading model based on config...")
+        # Use the imported function from audio_utils
         request.app.state.faster_whisper_model = set_faster_whisper_model(
             form_data.stt.WHISPER_MODEL, WHISPER_MODEL_AUTO_UPDATE
         )
+    elif hasattr(request.app.state, 'faster_whisper_model'):
+         # If engine changed away from local, unload the model to free memory
+         log.info("STT Engine changed from local, unloading Faster-Whisper model.")
+         del request.app.state.faster_whisper_model # Or set to None
 
     return {
         "tts": {
@@ -484,259 +455,188 @@ async def speech(request: Request, user=Depends(get_verified_user)):
         return FileResponse(file_path)
 
 
-def transcribe(request: Request, file_path):
-    log.info(f"transcribe: {file_path}")
+##########################################
+#
+# STT Transcription Function (Using Handlers)
+#
+##########################################
+
+def transcribe(request: Request, file_path: str):
+    """
+    Transcribes the audio file using the configured STT engine handler.
+    Helper function called by the transcription route.
+    """
+    log.info(f"Attempting to transcribe file: {file_path}")
     filename = os.path.basename(file_path)
     file_dir = os.path.dirname(file_path)
-    id = filename.split(".")[0]
+    # Use filename without extension for ID to be consistent
+    id = os.path.splitext(filename)[0]
+    original_extension = os.path.splitext(filename)[1].lower() if '.' in filename else ""
 
-    if request.app.state.config.STT_ENGINE == "":
-        if request.app.state.faster_whisper_model is None:
-            request.app.state.faster_whisper_model = set_faster_whisper_model(
-                request.app.state.config.WHISPER_MODEL
-            )
+    engine = request.app.state.config.STT_ENGINE
+    log.info(f"Using STT Engine: '{engine if engine else 'local (Faster-Whisper)'}'")
 
-        model = request.app.state.faster_whisper_model
-        segments, info = model.transcribe(
-            file_path,
-            beam_size=5,
-            vad_filter=request.app.state.config.WHISPER_VAD_FILTER,
-        )
-        log.info(
-            "Detected language '%s' with probability %f"
-            % (info.language, info.language_probability)
-        )
+    try:
+        if engine == "":
+            # Call the local handler
+            data = handle_local_stt(request, file_path, filename, file_dir, id)
+        elif engine == "openai":
+            # Call the OpenAI handler
+            data = handle_openai_stt(request, file_path, filename, file_dir, id, original_extension)
+        elif engine == "deepgram":
+            # Call the Deepgram handler
+            data = handle_deepgram_stt(request, file_path, filename, file_dir, id)
+        elif engine == "azure":
+            # Call the Azure handler
+            data = handle_azure_stt(request, file_path, filename, file_dir, id, original_extension)
+        else:
+            log.error(f"Unsupported STT engine configured: {engine}")
+            # Raise an exception that the route handler will catch
+            raise ValueError(f"Unsupported STT engine configured: {engine}")
 
-        transcript = "".join([segment.text for segment in list(segments)])
-        data = {"text": transcript.strip()}
-
-        # save the transcript to a json file
-        transcript_file = f"{file_dir}/{id}.json"
-        with open(transcript_file, "w") as f:
-            json.dump(data, f)
-
-        log.debug(data)
+        log.info(f"Transcription successful using '{engine if engine else 'local'}' engine for ID: {id}.")
         return data
-    elif request.app.state.config.STT_ENGINE == "openai":
-        audio_format = get_audio_format(file_path)
-        if audio_format:
-            os.rename(file_path, file_path.replace(".wav", f".{audio_format}"))
-            # Convert unsupported audio file to WAV format
-            convert_audio_to_wav(
-                file_path.replace(".wav", f".{audio_format}"),
-                file_path,
-                audio_format,
-            )
+    except FileNotFoundError as fnf_error:
+        log.error(f"STT handler reported file not found: {fnf_error}")
+        raise fnf_error # Re-raise specific error
+    except NotImplementedError as ni_error:
+        log.error(f"STT handler reported feature not implemented: {ni_error}")
+        raise ni_error # Re-raise specific error
+    except Exception as e:
+        # Log the specific error originating from the handler
+        log.exception(f"STT transcription failed using '{engine if engine else 'local'}' handler for ID {id}: {e}")
+        # Re-raise the exception to be caught by the route handler
+        # Include the original error message for better debugging in the HTTP response
+        raise Exception(f"Handler Error: {e}")
 
-        r = None
+
+##########################################
+#
+# Transcription Route (Using Refactored Transcribe Function)
+#
+##########################################
+
+@router.post("/transcriptions")
+def transcription(
+    request: Request,
+    file: UploadFile = File(...),
+    user=Depends(get_verified_user),
+):
+    log.info(f"Received file '{file.filename}' with content type: {file.content_type}")
+
+    # Define supported MIME types explicitly
+    supported_mime_types = {
+        "audio/mpeg",  # mp3
+        "audio/wav", "audio/x-wav", # wav
+        "audio/ogg", # ogg
+        "audio/webm", # webm
+        "audio/x-m4a", "audio/mp4", # m4a, mp4 (often contains aac)
+        "audio/aac", # aac
+        "audio/flac", "audio/x-flac", # flac
+        # Add other potential types if needed
+    }
+
+    # Check content type
+    if file.content_type not in supported_mime_types and not file.content_type.startswith("audio/"):
+         log.warning(f"Potentially unsupported content type: {file.content_type}. Attempting transcription...")
+         # Let the backend try, raise error later if it fails
+
+    file_path = None # Ensure file_path is defined for potential cleanup in finally block
+    file_path_to_transcribe = None # Track the file passed to transcribe
+    try:
+        # Generate a unique ID using UUID for the file processing session
+        session_id = uuid.uuid4()
+        # Try to get original extension, default to '.bin' if none or unknown
+        original_ext = os.path.splitext(file.filename)[1].lower() if '.' in file.filename else '.bin'
+        if not original_ext: original_ext = '.bin' # Ensure it's not empty
+
+        # Use session_id and original extension for the initial saved file name
+        initial_filename = f"{session_id}{original_ext}"
+
+        # Define directory using session_id to group related files for this request
+        file_dir = os.path.join(CACHE_DIR, "audio", "transcriptions", str(session_id))
+        os.makedirs(file_dir, exist_ok=True)
+        file_path = os.path.join(file_dir, initial_filename)
+
+        log.info(f"Saving uploaded file to: {file_path}")
         try:
-            r = requests.post(
-                url=f"{request.app.state.config.STT_OPENAI_API_BASE_URL}/audio/transcriptions",
-                headers={
-                    "Authorization": f"Bearer {request.app.state.config.STT_OPENAI_API_KEY}"
-                },
-                files={"file": (filename, open(file_path, "rb"))},
-                data={"model": request.app.state.config.STT_MODEL},
-            )
+            # Save the uploaded file contents
+            async def save_file(): # Use async for reading file content potentially
+                async with aiofiles.open(file_path, "wb") as f:
+                    content = await file.read() # Read async
+                    await f.write(content)
+                    log.info(f"Successfully saved {len(content)} bytes to {file_path}")
+            # Run the async save function (FastAPI handles async route functions)
+            import asyncio
+            asyncio.run(save_file()) # Simple way to run async in sync context if needed, check FastAPI best practice
+            # If route is async, just 'await save_file()' might work
 
-            r.raise_for_status()
-            data = r.json()
+        except Exception as save_error:
+            log.exception(f"Failed to save uploaded file to {file_path}: {save_error}")
+            raise HTTPException(status_code=500, detail="Failed to save uploaded file.")
 
-            # save the transcript to a json file
-            transcript_file = f"{file_dir}/{id}.json"
-            with open(transcript_file, "w") as f:
-                json.dump(data, f)
-
-            return data
-        except Exception as e:
-            log.exception(e)
-
-            detail = None
-            if r is not None:
-                try:
-                    res = r.json()
-                    if "error" in res:
-                        detail = f"External: {res['error'].get('message', '')}"
-                except Exception:
-                    detail = f"External: {e}"
-
-            raise Exception(detail if detail else "Open WebUI: Server Connection Error")
-
-    elif request.app.state.config.STT_ENGINE == "deepgram":
+        # --- Compression (if needed) ---
         try:
-            # Determine the MIME type of the file
-            mime, _ = mimetypes.guess_type(file_path)
-            if not mime:
-                mime = "audio/wav"  # fallback to wav if undetectable
-
-            # Read the audio file
-            with open(file_path, "rb") as f:
-                file_data = f.read()
-
-            # Build headers and parameters
-            headers = {
-                "Authorization": f"Token {request.app.state.config.DEEPGRAM_API_KEY}",
-                "Content-Type": mime,
-            }
-
-            # Add model if specified
-            params = {}
-            if request.app.state.config.STT_MODEL:
-                params["model"] = request.app.state.config.STT_MODEL
-
-            # Make request to Deepgram API
-            r = requests.post(
-                "https://api.deepgram.com/v1/listen",
-                headers=headers,
-                params=params,
-                data=file_data,
-            )
-            r.raise_for_status()
-            response_data = r.json()
-
-            # Extract transcript from Deepgram response
-            try:
-                transcript = response_data["results"]["channels"][0]["alternatives"][
-                    0
-                ].get("transcript", "")
-            except (KeyError, IndexError) as e:
-                log.error(f"Malformed response from Deepgram: {str(e)}")
-                raise Exception(
-                    "Failed to parse Deepgram response - unexpected response format"
-                )
-            data = {"text": transcript.strip()}
-
-            # Save transcript
-            transcript_file = f"{file_dir}/{id}.json"
-            with open(transcript_file, "w") as f:
-                json.dump(data, f)
-
-            return data
-
-        except Exception as e:
-            log.exception(e)
-            detail = None
-            if r is not None:
-                try:
-                    res = r.json()
-                    if "error" in res:
-                        detail = f"External: {res['error'].get('message', '')}"
-                except Exception:
-                    detail = f"External: {e}"
-            raise Exception(detail if detail else "Open WebUI: Server Connection Error")
-
-    elif request.app.state.config.STT_ENGINE == "azure":
-        # Check file exists and size
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=400, detail="Audio file not found")
-
-        # Check file size (Azure has a larger limit of 200MB)
-        file_size = os.path.getsize(file_path)
-        if file_size > AZURE_MAX_FILE_SIZE:
+            # Pass the initially saved file path to the compression function
+            file_path_to_transcribe = compress_audio(file_path)
+            # The filename for the STT API/handler should reflect the file being sent
+            filename_to_transcribe = os.path.basename(file_path_to_transcribe)
+            log.info(f"File to be transcribed after compression check: {file_path_to_transcribe}")
+        except ValueError as ve: # Catch specific error for file too large after compression
+            log.error(f"Compression check failed: {ve}")
             raise HTTPException(
-                status_code=400,
-                detail=f"File size exceeds Azure's limit of {AZURE_MAX_FILE_SIZE_MB}MB",
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(ve), # Use the message from the ValueError
             )
-
-        api_key = request.app.state.config.AUDIO_STT_AZURE_API_KEY
-        region = request.app.state.config.AUDIO_STT_AZURE_REGION
-        locales = request.app.state.config.AUDIO_STT_AZURE_LOCALES
-
-        # IF NO LOCALES, USE DEFAULTS
-        if len(locales) < 2:
-            locales = [
-                "en-US",
-                "es-ES",
-                "es-MX",
-                "fr-FR",
-                "hi-IN",
-                "it-IT",
-                "de-DE",
-                "en-GB",
-                "en-IN",
-                "ja-JP",
-                "ko-KR",
-                "pt-BR",
-                "zh-CN",
-            ]
-            locales = ",".join(locales)
-
-        if not api_key or not region:
+        except Exception as compress_error:
+            log.exception(f"Audio compression failed: {compress_error}")
             raise HTTPException(
-                status_code=400,
-                detail="Azure API key and region are required for Azure STT",
+                status_code=500, detail=f"Audio compression failed: {compress_error}"
             )
 
-        r = None
+        # --- Transcription (using the refactored function) ---
         try:
-            # Prepare the request
-            data = {
-                "definition": json.dumps(
-                    {
-                        "locales": locales.split(","),
-                        "diarization": {"maxSpeakers": 3, "enabled": True},
-                    }
-                    if locales
-                    else {}
-                )
-            }
-            url = f"https://{region}.api.cognitive.microsoft.com/speechtotext/transcriptions:transcribe?api-version=2024-11-15"
+            # Call the main transcribe function which delegates to handlers
+            data = transcribe(request, file_path_to_transcribe)
 
-            # Use context manager to ensure file is properly closed
-            with open(file_path, "rb") as audio_file:
-                r = requests.post(
-                    url=url,
-                    files={"audio": audio_file},
-                    data=data,
-                    headers={
-                        "Ocp-Apim-Subscription-Key": api_key,
-                    },
-                )
-
-            r.raise_for_status()
-            response = r.json()
-
-            # Extract transcript from response
-            if not response.get("combinedPhrases"):
-                raise ValueError("No transcription found in response")
-
-            # Get the full transcript from combinedPhrases
-            transcript = response["combinedPhrases"][0].get("text", "").strip()
-            if not transcript:
-                raise ValueError("Empty transcript in response")
-
-            data = {"text": transcript}
-
-            # Save transcript to json file (consistent with other providers)
-            transcript_file = f"{file_dir}/{id}.json"
-            with open(transcript_file, "w") as f:
-                json.dump(data, f)
-
-            log.debug(data)
-            return data
-
-        except (KeyError, IndexError, ValueError) as e:
-            log.exception("Error parsing Azure response")
+            # Return the result along with the filename of the file actually transcribed
+            return {**data, "filename": filename_to_transcribe}
+        except FileNotFoundError:
+             # Handle file not found specifically if it occurs during transcription call
+             log.error(f"Transcription failed because file {file_path_to_transcribe} was not found by the handler.")
+             raise HTTPException(status_code=404, detail="Audio file not found during processing.")
+        except NotImplementedError as nie:
+             log.error(f"Transcription failed because the handler is not fully implemented: {nie}")
+             raise HTTPException(status_code=501, detail=str(nie)) # 501 Not Implemented
+        except Exception as transcribe_error:
+            # Catch errors raised from the transcribe function (and its handlers)
+            log.exception(f"Transcription process failed: {transcribe_error}")
+            # Return a more informative error based on the exception message from the handler
             raise HTTPException(
-                status_code=500,
-                detail=f"Failed to parse Azure response: {str(e)}",
+                status_code=status.HTTP_400_BAD_REQUEST, # Or 500 for server-side handler issues
+                detail=f"Transcription failed: {transcribe_error}",
             )
-        except requests.exceptions.RequestException as e:
-            log.exception(e)
-            detail = None
 
-            try:
-                if r is not None and r.status_code != 200:
-                    res = r.json()
-                    if "error" in res:
-                        detail = f"External: {res['error'].get('message', '')}"
-            except Exception:
-                detail = f"External: {e}"
-
-            raise HTTPException(
-                status_code=getattr(r, "status_code", 500) if r else 500,
-                detail=detail if detail else "Open WebUI: Server Connection Error",
-            )
+    except HTTPException as http_exc:
+        # Re-raise HTTPExceptions directly (e.g., from compression size check)
+        raise http_exc
+    except Exception as e:
+        # Catch any other unexpected errors during the overall process
+        log.exception(f"An unexpected error occurred during transcription request for '{file.filename}': {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=ERROR_MESSAGES.DEFAULT(e),
+        )
+    finally:
+        # Cleanup logic: remove the temporary directory created for this request
+        if 'file_dir' in locals() and os.path.exists(file_dir):
+             try:
+                 import shutil
+                 shutil.rmtree(file_dir)
+                 log.info(f"Cleaned up temporary directory: {file_dir}")
+             except Exception as cleanup_error:
+                 log.error(f"Error cleaning up temporary directory {file_dir}: {cleanup_error}")
+        log.info(f"Transcription request processing finished for original file '{file.filename}'.")
 
 
 def compress_audio(file_path):
@@ -755,67 +655,6 @@ def compress_audio(file_path):
         return compressed_path
     else:
         return file_path
-
-
-@router.post("/transcriptions")
-def transcription(
-    request: Request,
-    file: UploadFile = File(...),
-    user=Depends(get_verified_user),
-):
-    log.info(f"file.content_type: {file.content_type}")
-
-    supported_filetypes = ("audio/mpeg", "audio/wav", "audio/ogg", "audio/x-m4a")
-
-    if not file.content_type.startswith(supported_filetypes):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=ERROR_MESSAGES.FILE_NOT_SUPPORTED,
-        )
-
-    try:
-        ext = file.filename.split(".")[-1]
-        id = uuid.uuid4()
-
-        filename = f"{id}.{ext}"
-        contents = file.file.read()
-
-        file_dir = f"{CACHE_DIR}/audio/transcriptions"
-        os.makedirs(file_dir, exist_ok=True)
-        file_path = f"{file_dir}/{filename}"
-
-        with open(file_path, "wb") as f:
-            f.write(contents)
-
-        try:
-            try:
-                file_path = compress_audio(file_path)
-            except Exception as e:
-                log.exception(e)
-
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=ERROR_MESSAGES.DEFAULT(e),
-                )
-
-            data = transcribe(request, file_path)
-            file_path = file_path.split("/")[-1]
-            return {**data, "filename": file_path}
-        except Exception as e:
-            log.exception(e)
-
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=ERROR_MESSAGES.DEFAULT(e),
-            )
-
-    except Exception as e:
-        log.exception(e)
-
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=ERROR_MESSAGES.DEFAULT(e),
-        )
 
 
 def get_available_models(request: Request) -> list[dict]:
