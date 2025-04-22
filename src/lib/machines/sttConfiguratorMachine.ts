@@ -63,14 +63,26 @@ export const sttConfiguratorMachine = setup({
 		assignConfig: assign({
 			sttEngineSetting: ({ context, event }) => {
 				console.log('[Configurator Assign] Event type:', event.type);
+				let newEngine: SttEngine | undefined | '' = undefined;
 				if (event.type === 'CONFIG_UPDATE') {
-					console.log('[Configurator Assign] Assigning sttEngineSetting from CONFIG_UPDATE:', event.settings.sttEngineSetting);
-					return event.settings.sttEngineSetting ?? context.sttEngineSetting;
+					newEngine = event.settings.sttEngineSetting;
+					console.log('[Configurator Assign] Received sttEngineSetting from CONFIG_UPDATE:', newEngine);
 				} else if (event.type === 'START_SESSION') {
-					console.log('[Configurator Assign] Assigning sttEngineSetting from START_SESSION:', event.initialConfig?.sttEngineSetting);
-					return event.initialConfig?.sttEngineSetting ?? context.sttEngineSetting;
+					newEngine = event.initialConfig?.sttEngineSetting;
+					console.log('[Configurator Assign] Received sttEngineSetting from START_SESSION:', newEngine);
 				}
-				return context.sttEngineSetting;
+
+				// If the received engine is empty string or falsy, default to 'whisper' or keep existing
+				if (newEngine === '') {
+					console.log('[Configurator Assign] Received empty string for engine, defaulting to \'whisper\'.');
+					return 'whisper';
+				} else if (newEngine && ['whisper', 'web', 'whisper-live', 'none'].includes(newEngine)) {
+					return newEngine; // Return valid engine setting
+				} else {
+					// If newEngine is undefined or invalid, keep the existing context value
+					console.log('[Configurator Assign] No valid engine setting received, keeping existing:', context.sttEngineSetting);
+					return context.sttEngineSetting;
+				}
 			},
 			apiToken: ({ context, event }) => {
 				if (event.type === 'CONFIG_UPDATE') {
@@ -198,12 +210,21 @@ export const sttConfiguratorMachine = setup({
 	},
 }).createMachine({
 	id: 'sttConfigurator',
-	context: ({ input }) => ({
-		sttEngineSetting: input?.sttEngineSetting ?? 'none',
-		apiToken: input?.apiToken ?? null,
-		transcribeFn: input?.transcribeFn,
-		managerRef: null,
-	}),
+	context: ({ input }) => {
+		const initialEngineSetting = input?.sttEngineSetting;
+		const validatedEngineSetting = 
+			initialEngineSetting && ['whisper', 'web', 'whisper-live', 'none'].includes(initialEngineSetting)
+			? initialEngineSetting 
+			: 'whisper'; // Default to 'whisper' if input is empty, null, undefined, or invalid
+		console.log(`[Configurator Context] Initializing. Input engine: '${initialEngineSetting}', Validated engine: '${validatedEngineSetting}'`);
+
+		return {
+			sttEngineSetting: validatedEngineSetting,
+			apiToken: input?.apiToken ?? null,
+			transcribeFn: input?.transcribeFn,
+			managerRef: null,
+		}
+	},
 	initial: 'idle',
 	states: {
 		idle: {

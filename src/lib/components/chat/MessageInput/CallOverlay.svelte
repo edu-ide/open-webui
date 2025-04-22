@@ -80,8 +80,8 @@
 	// STT Configurator Machine (Master)
 	const { snapshot: sttConfiguratorSnapshot, send: sendSttConfigurator } = useMachine(sttConfiguratorMachine, {
 		input: {
-			// Provide initial configuration from settings store
-			sttEngineSetting: (($settings as any)?.audio?.stt?.engine ?? 'whisper') as SttEngine,
+			// Provide initial configuration
+			sttEngineSetting: (($config as any)?.audio?.stt?.engine ?? 'whisper') as SttEngine,
 			apiToken: localStorage.token,
 			transcribeFn: transcribeAudio // Assuming this is for Whisper
 		}
@@ -268,17 +268,16 @@
 	// Call Session Activation: Trigger Configurator's START_SESSION
 	let overlayJustOpened = false;
 	$: {
-		// Read engine from settings store
-		const currentEngine = ($settings as any)?.audio?.stt?.engine as SttEngine | undefined | '';
+		const currentEngine = ($config as any)?.audio?.stt?.engine as SttEngine | undefined | '';
 
 		// Log the conditions before the if statement
-		console.log(`[CallOverlay Reactive Check] Conditions: show=${$showCallOverlay}, !justOpened=${!overlayJustOpened}, isIdle=${$sttConfiguratorSnapshot?.matches('idle')}, engine='${currentEngine}' (from settings)`);
+		console.log(`[CallOverlay Reactive Check] Conditions: show=${$showCallOverlay}, !justOpened=${!overlayJustOpened}, isIdle=${$sttConfiguratorSnapshot?.matches('idle')}, engine='${currentEngine}'`);
 
 		// Check if currentEngine is one of the valid, non-empty engine types
 		const isValidEngine = currentEngine === 'whisper' || currentEngine === 'web' || currentEngine === 'whisper-live';
 
 		if ($showCallOverlay && !overlayJustOpened && $sttConfiguratorSnapshot?.matches('idle') && isValidEngine) {
-			console.log(`CallOverlay opened, engine '${currentEngine}' (from settings) confirmed, starting STT session...`);
+			console.log(`CallOverlay opened, engine '${currentEngine}' confirmed, starting STT session...`);
 			sendSttConfigurator({
 				type: 'START_SESSION',
 				initialConfig: {
@@ -362,12 +361,11 @@
 	}
 
 	// Reactive effect for STT engine config changes (Send CONFIG_UPDATE to Configurator)
-	// Now monitor $settings store for changes
-	let currentEngineSetting = ($settings as any)?.audio?.stt?.engine ?? 'whisper';
+	let currentEngineSetting = ($config as any)?.audio?.stt?.engine ?? 'whisper';
 	$: {
-		const newEngine = ($settings as any)?.audio?.stt?.engine ?? 'whisper'; // Read from settings
+		const newEngine = ($config as any)?.audio?.stt?.engine ?? 'whisper';
 		if (newEngine && newEngine !== currentEngineSetting) {
-			console.log(`[CallOverlay] STT Engine changed in settings from ${currentEngineSetting} to ${newEngine}. Sending CONFIG_UPDATE to Configurator.`);
+			console.log(`[CallOverlay] STT Engine changed from ${currentEngineSetting} to ${newEngine}. Sending CONFIG_UPDATE to Configurator.`);
 			sendSttConfigurator({
 				type: 'CONFIG_UPDATE',
 				settings: {
@@ -446,12 +444,11 @@
 
 		// Start the STT session when component mounts if overlay is shown and config is ready
 		if ($showCallOverlay) {
-			// Read initial engine from settings store
-			const initialEngine = ($settings as any)?.audio?.stt?.engine as SttEngine | undefined | '';
+			const initialEngine = ($config as any)?.audio?.stt?.engine as SttEngine | undefined | '';
 			const isValidInitialEngine = initialEngine === 'whisper' || initialEngine === 'web' || initialEngine === 'whisper-live';
 
 			if (isValidInitialEngine) {
-				console.log(`[CallOverlay onMount] Overlay shown, engine '${initialEngine}' (from settings) confirmed, starting STT session...`);
+				console.log(`[CallOverlay onMount] Overlay shown, engine '${initialEngine}' confirmed, starting STT session...`);
 				sendSttConfigurator({
 					type: 'START_SESSION',
 					initialConfig: {
@@ -462,7 +459,7 @@
 				});
 				overlayJustOpened = true; // Set flag to prevent immediate re-trigger in reactive block
 			} else {
-				 console.warn(`[CallOverlay onMount] Overlay shown, but initial engine config ('${initialEngine}' from settings) is not valid/ready yet. Session will start when config updates.`);
+				 console.warn(`[CallOverlay onMount] Overlay shown, but initial engine config ('${initialEngine}') is not valid/ready yet. Session will start when config updates.`);
 			}
 		}
 	});
