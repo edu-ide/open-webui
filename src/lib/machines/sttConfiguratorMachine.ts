@@ -41,6 +41,7 @@ export interface SttConfiguratorContext extends MachineContext {
 	workerError: string | null;
 	workerCurrentTranscript: string | null;
 	workerFinalTranscript: string | null;
+	workerRmsLevel: number; // Added RMS level from worker
 }
 
 export type SttConfiguratorEvent =
@@ -241,30 +242,69 @@ export const sttConfiguratorMachine = setup({
 				return context.workerCurrentTranscript;
 			},
 			workerFinalTranscript: ({ context, event }) => {
-				// Reset final transcript if state update implies it (e.g., error, not listening)
+				// Handle state update from worker
 				if (event.type === 'WORKER_STATE_UPDATE') {
-					if (event.state?.error || !event.state?.isListening) {
-						// Keep existing final transcript unless explicitly cleared by MANAGER_TRANSCRIPTION_UPDATE?
-						// return null; // Maybe clear it?
-					}
-					// WORKER_STATE_UPDATE might carry the final transcript for some workers
-					if (typeof event.state?.finalTranscript === 'string') {
-						return event.state.finalTranscript;
+					// Worker now sends null or string for finalTranscript
+					const finalTranscript = event.state?.finalTranscript;
+					// Assign if it's a string or null, otherwise keep existing
+					if (typeof finalTranscript === 'string' || finalTranscript === null) {
+						return finalTranscript;
 					}
 				}
-				// MANAGER_TRANSCRIPTION_UPDATE handles final transcript for Whisper Manager/Live
+				// Handle direct update event (e.g., from Whisper Manager/Live)
 				if (event.type === 'MANAGER_TRANSCRIPTION_UPDATE') {
+					// Directly assign the value (can be string or null)
 					return event.finalTranscript;
 				}
+				// Keep existing value if no relevant update
 				return context.workerFinalTranscript;
+			},
+			workerRmsLevel: ({ context, event }) => {
+				if (event.type === 'WORKER_STATE_UPDATE' && typeof event.state?.rmsLevel === 'number') {
+					return event.state.rmsLevel;
+				}
+				return context.workerRmsLevel; // Keep existing if not updated
 			}
 		}),
 		clearWorkerState: assign({
 			workerIsListening: false,
 			workerError: null,
 			workerCurrentTranscript: null,
-			workerFinalTranscript: null
+			workerFinalTranscript: null, // Ensure reset to null
+			workerRmsLevel: 0 // Reset RMS level
 		}),
+		// Action to send the appropriate start command based on the engine type
+		sendStartCommandToActor: sendTo(
+			({ context }) => context.managerRef!,
+			({ context }) => {
+				if (!context.managerRef) {
+					console.error('[Configurator] Cannot send start command: managerRef is null.');
+					return undefined;
+				}
+				const targetActorId = context.managerRef.id;
+
+				switch (context.sttEngineSetting) {
+					case 'whisper':
+						if (context.apiToken && context.transcribeFn) {
+							console.log(`[Configurator] Sending START_CALL to Whisper Manager ${targetActorId}`);
+							return { type: 'START_CALL', payload: { token: context.apiToken, transcribeFn: context.transcribeFn } };
+						} else {
+							console.error('[Configurator] Cannot send START_CALL to Whisper Manager: missing token or transcribeFn.');
+							return undefined;
+						}
+					case 'web':
+						console.log(`[Configurator] Sending START to WebSpeech Worker ${targetActorId}`);
+						return { type: 'START' };
+					case 'whisper-live':
+						console.log(`[Configurator] Sending START_LISTENING to Whisper Live Worker ${targetActorId}`);
+						return { type: 'START_LISTENING' };
+					case 'none':
+					default:
+						console.warn(`[Configurator] No start command sent for engine type: ${context.sttEngineSetting}`);
+						return undefined;
+				}
+			}
+		),
 	},
 	guards: {
 		hasActorRef: ({ context }) => context.managerRef !== null, // Renamed from hasManagerRef
@@ -284,7 +324,8 @@ export const sttConfiguratorMachine = setup({
 		workerIsListening: false,
 		workerError: null,
 		workerCurrentTranscript: null,
-		workerFinalTranscript: null,
+		workerFinalTranscript: null, // Ensure initialized as null
+		workerRmsLevel: 0 // Initialize RMS level
 	}),
 	initial: 'idle',
 	states: {
@@ -301,7 +342,7 @@ export const sttConfiguratorMachine = setup({
 			entry: [
 				log('[Configurator] Entering active state, attempting to spawn actor...'),
 				'spawnActor',
-				'startWorker' // Add the action to start the spawned actor
+				'sendStartCommandToActor' // Send the appropriate start command based on engine
 			] as const,
 			exit: ['stopActor', log('[Configurator] Exiting active state, stopping actor.')] as const,
 			on: {

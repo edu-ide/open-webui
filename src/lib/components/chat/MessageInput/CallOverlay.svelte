@@ -56,6 +56,9 @@
 	let canvasElement: HTMLCanvasElement | null = null;
 	let audioElement: HTMLAudioElement | null = null;
 
+	// Variable to track previous error message for toast logic
+	let previousError: string | null = null;
+
 	// --- State Machines ---
 
 	// TTS Machine
@@ -78,7 +81,7 @@
 	const { snapshot: callSnapshot, send: sendCall } = useMachine(callMachine);
 
 	// Determine initial STT engine based on browser
-	let initialSttEngine: SttEngine = 'whisper-live';
+	let initialSttEngine: SttEngine = 'web';
 	/* // Remove or comment out browser detection for testing Whisper as default
 	if (
 		typeof navigator !== 'undefined' &&
@@ -127,9 +130,18 @@
 	// Reactive log for UI conditions (Read directly from configurator context)
 	$: {
 		console.log(
-			`[CallOverlay UI Check] Configurator State: ${$sttConfiguratorSnapshot.value}, Worker Listening: ${$sttConfiguratorSnapshot.context.workerIsListening}, Final Text: ${$sttConfiguratorSnapshot.context.workerFinalTranscript}`
+			// `[CallOverlay UI Check] Configurator State: ${$sttConfiguratorSnapshot.value}, Worker Listening: ${$sttConfiguratorSnapshot.context.workerIsListening}, RMS: ${$sttConfiguratorSnapshot.context.workerRmsLevel?.toFixed(2)}, Final Text: ${$sttConfiguratorSnapshot.context.workerFinalTranscript}`
 		);
 	}
+
+	// --- RMS Level for UI Scaling --- 
+	// Apply some smoothing or logarithmic scale if needed, basic scaling for now
+	// Base scale (e.g., 1.0) + RMS level multiplied by a factor
+	// Clamped between a min and max scale to avoid extremes
+	const minScale = 1.0;
+	const maxScale = 1.15; // Adjust max scale factor as needed
+	const scaleFactor = 0.5; // Adjust sensitivity
+	$: rmsBasedScale = Math.min(maxScale, minScale + ($sttConfiguratorSnapshot.context.workerRmsLevel || 0) * scaleFactor);
 
 	// --- Camera Variables ---
 	let videoInputDevices: MediaDeviceInfo[] = [];
@@ -322,7 +334,7 @@
 			if (camera && cameraStream) {
 				const imageUrl = takeScreenshot();
 				files = imageUrl ? [{ type: 'image', url: imageUrl }] : [];
-		} else {
+				} else {
 				files = [];
 			}
 
@@ -351,7 +363,7 @@
 			console.log('[CallOverlay] Call active, sending START_CALL via Configurator...');
 			if ($sttConfiguratorSnapshot.matches('active')) {
 				sendSttConfigurator({ type: 'START_CALL' });
-				} else {
+		} else {
 				console.warn('[CallOverlay] Call became active, but STT Configurator is not ready.');
 			}
 		} else if (previousCallState === 'active' && !$callSnapshot.matches('active')) {
@@ -361,7 +373,7 @@
 				sendSttConfigurator({ type: 'STOP_CALL' });
 				// Optionally also send STOP_SESSION if call ending means STT should fully stop
 				// sendSttConfigurator({ type: 'STOP_SESSION' });
-			} else {
+		} else {
 				console.warn('[CallOverlay] Call became inactive, but STT Configurator was not active.');
 			}
 		}
@@ -408,6 +420,34 @@
 				config: { apiConfig: { token: newToken, modelId, chatId } }
 			});
 			currentToken = newToken;
+		}
+	}
+
+	// STT Error Handling (Read workerError from Configurator context)
+	$: {
+		const currentError = $sttConfiguratorSnapshot.context.workerError;
+		if (currentError && currentError !== previousError) {
+			// Log the actual error received before showing the toast
+			console.error('[CallOverlay] Received STT Error from Configurator:', currentError);
+			toast.error(`STT Error: ${currentError}`); // Display the actual error message
+		}
+		previousError = currentError;
+	}
+
+	// Empty Transcription Toast Handling
+	$: {
+		const currentFinalizedText = $sttConfiguratorSnapshot.context.workerFinalTranscript;
+		if (
+			currentFinalizedText === '' && // Handle explicitly empty finalized text
+			previousFinalizedText !== '' // Check if it just became empty
+		) {
+			files = [];
+			console.log('[CallOverlay] Empty transcription result received.');
+			toast.info("Couldn't hear anything clearly.");
+		}
+		// Only update previous text if it was successfully read
+		if (currentFinalizedText !== undefined) {
+			previousFinalizedText = currentFinalizedText;
 		}
 	}
 
@@ -526,10 +566,8 @@
 				{:else}
 					<!-- Profile image / Listening indicator (Use workerIsListening, remove rmsLevel style) -->
 					<div
-						class="transition-all rounded-full bg-cover bg-center bg-no-repeat {$sttConfiguratorSnapshot.context.workerIsListening ? 'ring-2 ring-blue-500 ring-offset-2 dark:ring-offset-gray-800' : ''} size-12 {(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? '' : 'bg-black dark:bg-white'}"
-						style={(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png'
-							? `background-image: url('${model?.info?.meta?.profile_image_url}');`
-							: ''}
+						class="transition-transform duration-100 ease-out rounded-full bg-cover bg-center bg-no-repeat {$sttConfiguratorSnapshot.context.workerIsListening ? 'ring-4 ring-blue-500 ring-offset-4 dark:ring-offset-gray-800' : ''} size-40 {(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? '' : 'bg-black dark:bg-white'}"
+						style="{`${(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? `background-image: url('${model?.info?.meta?.profile_image_url}');` : ''} transform: scale(${$sttConfiguratorSnapshot.context.workerIsListening ? rmsBasedScale : 1.0});`}"
 					/>
 				{/if}
 			</button>
@@ -561,10 +599,8 @@
 					{:else}
 						<!-- Profile image / Listening indicator (Use workerIsListening, remove rmsLevel style) -->
 						<div
-							class="transition-all rounded-full bg-cover bg-center bg-no-repeat {$sttConfiguratorSnapshot.context.workerIsListening ? 'ring-4 ring-blue-500 ring-offset-4 dark:ring-offset-gray-800' : ''} size-40 {(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? '' : 'bg-black dark:bg-white'}"
-							style={(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png'
-								? `background-image: url('${model?.info?.meta?.profile_image_url}');`
-								: ''}
+							class="transition-transform duration-100 ease-out rounded-full bg-cover bg-center bg-no-repeat {$sttConfiguratorSnapshot.context.workerIsListening ? 'ring-4 ring-blue-500 ring-offset-4 dark:ring-offset-gray-800' : ''} size-40 {(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? '' : 'bg-black dark:bg-white'}"
+							style="{`${(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? `background-image: url('${model?.info?.meta?.profile_image_url}');` : ''} transform: scale(${$sttConfiguratorSnapshot.context.workerIsListening ? rmsBasedScale : 1.0});`}"
 						/>
 					{/if}
 					{#if $sttConfiguratorSnapshot.context.workerIsListening}

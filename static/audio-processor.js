@@ -30,20 +30,55 @@ class AudioProcessor extends AudioWorkletProcessor {
     super(options);
     this._isRecording = false; // Flag to control processing/posting
     this._targetSampleRate = 16000; // Target sample rate for Whisper
+    this._rmsUpdateInterval = 100; // Send RMS update every 100ms (approx)
+    this._lastRmsUpdateTime = 0;
+
+    // VAD parameters
+    this._vadThreshold = 0.02; // Adjust this threshold based on testing
+    this._vadSilenceDuration = 2000; // Silence duration in ms to trigger VAD_SILENCE_START (Increased from 1000)
+    this._isSpeaking = false; // Current VAD state
+    this._silenceStartTime = 0; // Timestamp when silence started
 
     // Listen for messages from the main thread (start/stop recording)
     this.port.onmessage = (event) => {
       if (event.data.type === 'start') {
         this._isRecording = true;
+        this._lastRmsUpdateTime = currentTime;
+        this._isSpeaking = false; // Reset VAD state on start
+        this._silenceStartTime = 0;
         console.log('[AudioWorklet] Recording started.');
       } else if (event.data.type === 'stop') {
         this._isRecording = false;
+        console.log(`[AudioWorklet] Received 'stop' message. _isRecording set to: ${this._isRecording}`);
         console.log('[AudioWorklet] Recording stopped.');
       } else if (event.data.type === 'setTargetSampleRate') {
         this._targetSampleRate = event.data.targetSampleRate;
         console.log(`[AudioWorklet] Target sample rate set to ${this._targetSampleRate}`);
+      } else if (event.data.type === 'updateVadThreshold') {
+          this._vadThreshold = event.data.threshold;
+          console.log(`[AudioWorklet] VAD threshold updated to ${this._vadThreshold}`);
+      } else if (event.data.type === 'updateVadSilenceDuration') {
+          this._vadSilenceDuration = event.data.duration;
+          console.log(`[AudioWorklet] VAD silence duration updated to ${this._vadSilenceDuration}`);
       }
     };
+  }
+
+  /**
+   * Calculates the RMS level of an audio buffer.
+   * @param {Float32Array} buffer - The audio data.
+   * @returns {number} The RMS level (0-1 range, approximately).
+   */
+  _calculateRMS(buffer) {
+    let sumOfSquares = 0;
+    for (let i = 0; i < buffer.length; i++) {
+      sumOfSquares += buffer[i] * buffer[i];
+    }
+    const meanSquare = sumOfSquares / buffer.length;
+    const rms = Math.sqrt(meanSquare);
+    // Use raw RMS for VAD, normalize for UI feedback later if needed
+    // return Math.min(rms * 5, 1.0); // Normalization removed for VAD
+    return rms;
   }
 
   /**
@@ -54,23 +89,67 @@ class AudioProcessor extends AudioWorkletProcessor {
    * @returns {boolean} - Return true to keep the processor alive.
    */
   process(inputs, outputs, parameters) {
-    // We expect a single input, single channel
     if (!this._isRecording || !inputs || !inputs[0] || !inputs[0][0]) {
-      return true; // Keep processor alive even if not recording
+      return true; // Keep processor alive
     }
 
-    const inputData = inputs[0][0]; // Get the Float32Array for the first channel
+    const inputData = inputs[0][0];
+    const nowMs = currentTime * 1000;
+    const currentRms = this._calculateRMS(inputData);
 
-    // Resample the audio data to 16kHz
-    // 'sampleRate' is a global variable available in AudioWorkletGlobalScope
+    // --- VAD Logic --- 
+    const isSpeechDetected = currentRms > this._vadThreshold;
+
+    if (isSpeechDetected) {
+      // Speech detected
+      this._silenceStartTime = 0; // Reset silence timer
+      if (!this._isSpeaking) {
+        // Transition: Silence -> Speech
+        this._isSpeaking = true;
+        console.log(`[AudioWorklet] VAD: Speech Start (RMS: ${currentRms.toFixed(4)})`);
+        console.log('[AudioWorklet] VAD: Posting VAD_SPEECH_START');
+        this.port.postMessage({ type: 'VAD_SPEECH_START' });
+      }
+    } else {
+      // Silence detected
+      if (this._isSpeaking) {
+        // Transition: Speech -> Silence
+        this._isSpeaking = false;
+        this._silenceStartTime = nowMs; // Start silence timer
+        console.log(`[AudioWorklet] VAD: Speech End (RMS: ${currentRms.toFixed(4)})`);
+        // Optionally send VAD_SPEECH_END event if needed by main thread
+        // this.port.postMessage({ type: 'VAD_SPEECH_END' });
+      } else if (this._silenceStartTime > 0) {
+        // Continuing silence
+        const silenceDuration = nowMs - this._silenceStartTime;
+        if (silenceDuration >= this._vadSilenceDuration) {
+          // Silence duration threshold reached
+          console.log(`[AudioWorklet] VAD: Silence threshold reached (${silenceDuration}ms).`);
+          console.log('[AudioWorklet] VAD: Posting VAD_SILENCE_START');
+          this.port.postMessage({ type: 'VAD_SILENCE_START' });
+          this._silenceStartTime = 0; // Reset timer to prevent repeated events
+        }
+      }
+    }
+
+    // --- RMS Update for UI --- 
+    if (nowMs - this._lastRmsUpdateTime > this._rmsUpdateInterval) {
+      if (this._isRecording) {
+        // Normalize RMS for UI here if desired, e.g., Math.min(currentRms * 5, 1.0)
+        this.port.postMessage({ type: 'RMS_UPDATE', value: Math.min(currentRms * 5, 1.0) }); 
+      }
+      this._lastRmsUpdateTime = nowMs;
+    }
+
+    // --- Audio Chunk Resampling and Sending --- 
     const resampledData = resample(inputData, sampleRate, this._targetSampleRate);
+    if (this._isRecording) { // Send audio whenever recording, regardless of VAD state
+      this.port.postMessage(resampledData.buffer, [resampledData.buffer]);
+    }
 
-    // Send the resampled Float32 data's ArrayBuffer back to the main thread
-    // The ArrayBuffer needs to be transferred, not copied, for performance.
-    // Note: We send the Float32 buffer directly, as deduced from Python client analysis
-    this.port.postMessage(resampledData.buffer, [resampledData.buffer]);
-
-    return true; // Keep processor alive
+    // Return false when not recording to terminate the processor
+    console.log(`[AudioWorklet] process function returning: ${this._isRecording}`);
+    return this._isRecording;
   }
 }
 
