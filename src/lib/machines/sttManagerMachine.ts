@@ -7,45 +7,100 @@ import {
 	stopChild,
 	type ActorRefFrom,
 	type AnyActorLogic,
-	type Subscription
+	type Subscription,
+	fromPromise,
+	createActor,
+	type DoneActorEvent,
+	type AssignArgs,
+	type Spawner,
+	type PromiseActorLogic,
+	type ErrorActorEvent
 } from 'xstate';
-import { sttMachine, type SttContext } from './sttMachine'; // Standard STT
-import { whisperLiveSttMachine, type WhisperLiveContext } from './whisperLiveSttMachine'; // Whisper-Live STT
+import { sttMachine, type SttContext, type SttEvent } from './sttMachine'; // Standard STT
+// import { whisperLiveSttMachine, type WhisperLiveContext } from './whisperLiveSttMachine'; // Comment out if not used
+// Placeholder imports for other engine workers (implement these later)
+// import { webSpeechWorkerMachine } from './webSpeechWorkerMachine';
+// import { whisperLiveWorkerMachine } from './whisperLiveWorkerMachine';
+
+// <<< 모듈 로드 로그 추가 >>>
+console.log('[sttManagerMachine.ts] Module loaded (Whisper Manager)');
+// <<< -------------------- >>>
 
 // --- Types ---
 
-type SttMode = 'standard' | 'whisper-live' | 'none';
+// type SttMode = 'standard' | 'whisper-live' | 'none'; // Removed, mode is implicitly 'whisper'
 
-// Combine relevant context parts from both child machines for UI display
+// Combine relevant context parts from the worker machine for UI display
 interface DisplayContext {
-	isListening: boolean; // General listening indicator
-	isRecording: boolean; // General recording indicator (might differ slightly)
+	isListening: boolean;
+	isRecording: boolean;
 	currentSegment: string | null;
 	lastFinalizedText: string | null;
 	statusMessage: string;
 	errorMessage: string | null;
-	rmsLevel: number; // Specific to standard mode, defaults to 0 otherwise
+	rmsLevel: number;
 }
 
+// Updated SttManagerContext (Whisper-specific)
 export interface SttManagerContext extends DisplayContext {
-	currentMode: SttMode;
-	sttEngineSetting: 'whisper' | 'whisper-live' | string; // From config
-	childRef: ActorRefFrom<AnyActorLogic> | null; // Actor ref for the active STT machine
-	childSubscription: Subscription | null; // Store subscription
-	apiToken: string | null; // Needed by both children
-	transcribeFn?: SttContext['transcribeFn']; // Needed by standard machine
+	// currentMode removed
+	// sttEngineSetting removed
+	apiToken: string | null;
+	transcribeFn: SttContext['transcribeFn']; // Now required, not optional
+	managerAudioStream: MediaStream | null;
+	minDecibels: number; // Config for workers
+	silenceDuration: number; // Config for workers
+	activeWorker: ActorRefFrom<typeof sttMachine> | null; // Back to specific type
+	processingWorkers: ActorRefFrom<typeof sttMachine>[]; // Back to specific type
+	finalTranscript: string; // Accumulate results
 }
 
+// Update Event Types
 type SttManagerEvent =
-	| { type: 'START_LISTENING'; payload?: { token?: string | null } }
-	| { type: 'STOP_LISTENING' }
+	| { type: 'START_CALL'; payload: { token: string | null, transcribeFn: SttContext['transcribeFn'] } } // Payload structure is key
+	| { type: 'STOP_CALL' }
 	| { type: 'RESET' }
-	| { type: 'CONFIG_UPDATE'; settings: { sttEngine: string; token?: string | null } }
-	// Internal events received via subscription callback
-	| { type: 'CHILD.UPDATE'; snapshot: any }
-	| { type: 'CHILD.ERROR'; error: string }
-    | { type: '_AUDIO_ANALYSIS_UPDATE'; rms: number }
-    | { type: 'STT_RESULT'; text: string };
+	// CONFIG_UPDATE might be simplified or removed if only managed by configurator now
+	// | { type: 'CONFIG_UPDATE'; settings: { token?: string | null } } // Example simplified version
+	| DoneActorEvent<MediaStream, 'micPermissionActor'>
+	| { type: 'error.platform.micPermissionActor'; error: unknown }
+	| { type: 'WORKER_SILENCE_DETECTED'; workerRef: ActorRefFrom<typeof sttMachine> }
+	| { type: 'WORKER_TRANSCRIPTION_RESULT'; text: string; workerRef: ActorRefFrom<typeof sttMachine> }
+	| { type: 'WORKER_ERROR'; error: string; workerRef: ActorRefFrom<typeof sttMachine> };
+
+// Type predicate functions for events
+function isMicPermissionSuccessEvent(event: SttManagerEvent): event is DoneActorEvent<MediaStream, 'micPermissionActor'> {
+	return event.type === 'xstate.done.actor.micPermissionActor' && event.output instanceof MediaStream && event.output.active;
+}
+
+function isMicPermissionPlatformErrorEvent(event: SttManagerEvent | ErrorActorEvent): event is ErrorActorEvent {
+	return event.type === 'xstate.error.actor.micPermissionActor';
+}
+
+function isPermissionDeniedError(event: SttManagerEvent): boolean {
+	if (isMicPermissionPlatformErrorEvent(event)) {
+		const errorEvent = event as ErrorActorEvent;
+		const error = errorEvent.error;
+		return error instanceof Error && (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError');
+	}
+	return false;
+}
+
+// --- 액터 로직을 미리 정의 ---
+const micPermissionActorLogic = fromPromise<MediaStream>(async () => {
+	console.log('[sttManager] Requesting microphone permission...');
+	if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+		throw new Error('MediaDevices API not available.');
+	}
+	const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+	console.log('[sttManager] Permission granted, stream received.');
+	if (!(stream instanceof MediaStream)) {
+		console.error('[sttManager] getUserMedia did not return a valid MediaStream!');
+		throw new Error('Invalid MediaStream received.');
+	}
+	return stream;
+});
+// ---------------------------
 
 // --- Machine Setup ---
 
@@ -53,250 +108,42 @@ export const sttManagerMachine = setup({
 	types: {
 		context: {} as SttManagerContext,
 		events: {} as SttManagerEvent,
-		// Input can provide initial settings
-		input: {} as Partial<Pick<SttManagerContext, 'sttEngineSetting' | 'apiToken' | 'transcribeFn'>>
+		// Input type updated - no sttEngineSetting
+		input: {} as Partial<Pick<SttManagerContext, 'minDecibels' | 'silenceDuration' | 'apiToken' | 'transcribeFn'>>,
 	},
 	actors: {
-		standardSttActor: sttMachine,
-		whisperLiveSttActor: whisperLiveSttMachine
+		micPermissionActor: micPermissionActorLogic
 	},
 	actions: {
-		updateContextFromChild: assign((contextAndEvent) => {
-			const { context, event } = contextAndEvent;
-			if (event.type !== 'CHILD.UPDATE' || !event.snapshot) {
-				return {};
-			}
-			const childSnapshot = event.snapshot;
-			console.log('[SttManager] Received child snapshot:', childSnapshot);
-
-			const childContext = childSnapshot.context as SttContext | WhisperLiveContext;
-			const childValue = childSnapshot.value;
-
-			// Default values
-			let updatedFields: Partial<SttManagerContext> = {
-				isListening: false,
-				isRecording: false,
-				currentSegment: null,
-				// Keep lastFinalizedText unless explicitly updated by CHILD.FINALIZED?
-				// lastFinalizedText: null,
-				statusMessage: 'Idle',
-				errorMessage: null,
-				// rmsLevel: 0 // Remove RMS update from here, handle separately
-			};
-
-			// Update based on the current mode and child state
-			if (context.currentMode === 'standard') {
-				const standardContext = childContext as SttContext;
-				updatedFields.isListening = childSnapshot.matches('listening');
-				updatedFields.isRecording = childSnapshot.matches('recording');
-				updatedFields.statusMessage = standardContext.errorMessage
-					? `Error: ${standardContext.errorMessage}`
-					: typeof childValue === 'string'
-						? childValue // Use state value as status if simple string
-						: 'Standard STT Active'; // Fallback status
-				updatedFields.errorMessage = standardContext.errorMessage;
-				// updatedFields.rmsLevel = standardContext.rmsLevel ?? 0; // Removed
-				// standard machine doesn't have currentSegment directly
-				updatedFields.currentSegment = null; // Or derive if needed later
-			} else if (context.currentMode === 'whisper-live') {
-				const whisperContext = childContext as WhisperLiveContext;
-				updatedFields.isListening = childSnapshot.matches('listening') || childSnapshot.matches('initializing_socket') || childSnapshot.matches('connecting');
-				updatedFields.isRecording = childSnapshot.matches('listening');
-				updatedFields.currentSegment = whisperContext.currentSegment;
-				// Don't clear lastFinalizedText here, handle in CHILD.FINALIZED
-				updatedFields.statusMessage = whisperContext.statusMessage ?? 'Whisper-Live Active';
-				updatedFields.errorMessage = whisperContext.errorMessage;
-                updatedFields.rmsLevel = 0;
-			} else {
-				// Mode 'none' or unexpected state
-				updatedFields.statusMessage = 'STT Disabled';
-                updatedFields.rmsLevel = 0;
-			}
-
-			console.log('[SttManager] Updating context from child snapshot:', updatedFields);
-			return updatedFields;
-		}),
-        // New action to specifically update RMS level
-        assignRmsLevel: assign({
-            rmsLevel: ({ event, context }) => {
-                if (event.type === '_AUDIO_ANALYSIS_UPDATE') {
-                    return event.rms;
-                }
-                // Return current context value if event type doesn't match
-                // This shouldn't happen if called correctly, but safer
-                return context.rmsLevel;
-            }
-        }),
 		assignApiToken: assign({
 			apiToken: ({ event, context }) => {
-				if (event.type === 'START_LISTENING' && event.payload?.token) {
-					return event.payload.token;
-				}
-				if (event.type === 'CONFIG_UPDATE' && event.settings.token) {
-					return event.settings.token;
-				}
-				return context.apiToken; // Keep existing if not provided/updated
+				if (event.type === 'START_CALL') return event.payload.token ?? context.apiToken;
+				// if (event.type === 'CONFIG_UPDATE' && event.settings.token) return event.settings.token;
+				return context.apiToken;
 			}
 		}),
-		assignEngineSetting: assign({
-			sttEngineSetting: ({ event, context }) => {
-				if (event.type === 'CONFIG_UPDATE') {
-					return event.settings.sttEngine;
+		// assignEngineSetting action removed
+		assignFinalizedText: assign({
+			finalTranscript: ({ event, context }) => {
+				if (event.type === 'WORKER_TRANSCRIPTION_RESULT' && typeof event.text === 'string') {
+					console.log(`[SttManager] Appending finalized text: "${event.text}"`);
+					return (context.finalTranscript + ' ' + event.text).trim();
 				}
-				return context.sttEngineSetting;
-			}
-		}),
-		spawnStandardStt: assign({
-			currentMode: 'standard',
-			childRef: ({ spawn, context, self }) => {
-				console.log('[SttManager] spawnStandardStt: Spawning child actor...');
-				const actorRef = spawn('standardSttActor', {
-					id: 'standardSttChild',
-					input: {
-						apiToken: context.apiToken,
-						transcribeFn: context.transcribeFn
-					}
-				});
-				console.log('[SttManager] spawnStandardStt: Spawned child actor ref:', actorRef);
-				return actorRef;
-			}
-		}),
-		subscribeToChild: assign({
-			childSubscription: ({ context, self }) => {
-				console.log('[SttManager] subscribeToChild: Checking context.childRef:', context.childRef);
-				if (!context.childRef) {
-					console.error('[SttManager] subscribeToChild: Cannot subscribe, childRef is null!');
-					return null;
-				}
-				console.log('[SttManager] subscribeToChild: Attempting to subscribe...');
-				try {
-					const subscription = context.childRef.subscribe(snapshot => {
-						 // console.log(`[SttManager/subscribe] Callback fired! Child state: ${snapshot.value}, Child RMS: ${snapshot.context.rmsLevel?.toFixed(4)}`); // Keep commented for now unless needed
-						// Send general update
-						self.send({ type: 'CHILD.UPDATE', snapshot });
-						// Send RMS update for standard mode
-						if (context.currentMode === 'standard') {
-							 const rmsFromChild = snapshot.context.rmsLevel ?? 0;
-							 self.send({ type: '_AUDIO_ANALYSIS_UPDATE', rms: rmsFromChild });
-						}
-
-						// --- Handle potential output events (fallback or for other machine types) ---
-						if (snapshot.output) {
-							if (snapshot.output.type === 'ERROR') {
-								 // Log parent state BEFORE sending event
-								console.log(`[SttManager/subscribe] Parent state is: ${self.getSnapshot().value}. Detected error output: "${snapshot.output.error}". Sending CHILD.ERROR.`);
-								self.send({ type: 'CHILD.ERROR', error: snapshot.output.error });
-							}
-						}
-					});
-					console.log('[SttManager] subscribeToChild: Successfully subscribed.');
-					return subscription;
-				} catch (error) {
-					console.error('[SttManager] subscribeToChild: Error subscribing:', error);
-					return null;
-				}
-			}
-		}),
-		spawnWhisperLiveStt: assign({
-			currentMode: 'whisper-live',
-			childRef: ({ spawn, context, self }) => {
-				console.log('[SttManager] Spawning Whisper-Live STT actor...');
-				const actorRef = spawn('whisperLiveSttActor', {
-					id: 'whisperLiveSttChild',
-					input: { apiToken: context.apiToken }
-				});
-				console.log('[SttManager] Spawned whisperLiveSttChild ref:', actorRef);
-				return actorRef;
+				return context.finalTranscript;
 			},
-			childSubscription: ({ context, self }) => {
-				if (!context.childRef) {
-					console.error('[SttManager] subscribeToChild (whisper): Cannot subscribe, childRef is null!');
-					return null;
-				}
-				console.log('[SttManager] Subscribing to whisperLiveSttChild...');
-				try {
-					const subscription = context.childRef.subscribe(snapshot => {
-						// 항상 일반 업데이트 전송
-						self.send({ type: 'CHILD.UPDATE', snapshot });
-						// 현재는 ERROR 출력만 처리
-						if (snapshot.output && snapshot.output.type === 'ERROR') {
-							console.log(`[SttManager/subscribe] Detected error in whisper-live output: "${snapshot.output.error}". Sending CHILD.ERROR.`);
-							self.send({ type: 'CHILD.ERROR', error: snapshot.output.error });
-						}
-						 // 다른 출력 처리 없음 (FINALIZED_TRANSCRIPTION 등)
-					});
-					console.log('[SttManager] Successfully subscribed to whisperLiveSttChild.');
-					return subscription;
-				} catch (error) {
-					console.error('[SttManager] subscribeToChild (whisper): Error subscribing:', error);
-					return null;
-				}
-			}
+			statusMessage: 'Received result'
 		}),
-		cleanupChildActor: assign(( { context } ) => {
-			console.log('[SttManager] Cleaning up child actor and subscription...');
-			// Unsubscribe if subscription exists
-			if (context.childSubscription) {
-				try {
-					context.childSubscription.unsubscribe();
-					console.log('[SttManager] Unsubscribed from child.');
-				} catch (e) {
-					console.error('[SttManager] Error unsubscribing:', e);
-				}
-			}
-			 // Stop the child actor - use stopChild logic conceptually
-			 if (context.childRef) {
-				 try {
-					 context.childRef.stop?.(); // Use stop method if available (XState v5 standard)
-					 console.log('[SttManager] Stopped child actor ref.');
-				 } catch (e) {
-					  console.error('[SttManager] Error stopping child actor ref:', e);
-				 }
-			}
-			// Reset context fields
-			return {
-				childRef: null,
-				childSubscription: null,
-				 // Also reset status related to the child being active
-				isListening: false,
-				isRecording: false,
-				currentSegment: null,
-				rmsLevel: 0,
-				// Keep errorMessage? Or clear it? Let's clear it here for now.
-				 // errorMessage: null,
-				 // Keep lastFinalizedText? Maybe.
-				// Decide if status should revert to Idle or something else
-				// statusMessage: 'Idle'
-			};
+		assignChildError: assign({
+			errorMessage: ({ event }) => {
+				if (event.type === 'WORKER_ERROR') return event.error;
+				return 'Unknown worker error';
+			},
+			statusMessage: 'Error',
+			isListening: false,
+			isRecording: false
 		}),
-		forwardToChild: sendTo(
-			({ context }) => context.childRef!,
-			({ event }) => event // Forward the original event
-		),
-        // Modify assignFinalizedText to handle STT_RESULT
-        assignFinalizedText: assign({
-            lastFinalizedText: ({ event, context }) => { // Add context here
-                // Check for STT_RESULT event type
-                if (event.type === 'STT_RESULT') {
-                    console.log(`[SttManager] assignFinalizedText executed. Assigning text: "${event.text}"`);
-                    return event.text;
-                }
-                console.warn(`[SttManager] assignFinalizedText called with unexpected event type: ${event.type}. Keeping previous value.`);
-                return context.lastFinalizedText; // Return existing value
-            },
-            currentSegment: null,
-            statusMessage: 'Finalized'
-		}),
-        // Specific action for child error update
-        assignChildError: assign({
-            errorMessage: ({ event }) => (event.type === 'CHILD.ERROR' ? event.error : 'Unknown child error'),
-            statusMessage: 'Error',
-            isListening: false,
-            isRecording: false,
-            currentSegment: null
-        }),
-		// Reset most of the display context, keep config
 		resetDisplayContext: assign({
+			// ... (remains the same, currentMode removed)
 			isListening: false,
 			isRecording: false,
 			currentSegment: null,
@@ -304,165 +151,325 @@ export const sttManagerMachine = setup({
 			statusMessage: 'Idle',
 			errorMessage: null,
 			rmsLevel: 0,
-			currentMode: 'none',
-			childRef: null,
-            childSubscription: null // Reset subscription here too
+			// currentMode: 'none', // Removed
 		}),
-        // Logging actions
-        logDeterminingInfo: log(
-			({ context }: { context: SttManagerContext }) => `[SttManager] In determiningMode. Engine setting: \"${context.sttEngineSetting}\". Is standard: ${context.sttEngineSetting === 'whisper'}. Is whisper-live: ${context.sttEngineSetting === 'whisper-live'}.`
-		),
-        logStandardActiveEntry: log('[SttManager] Entering standardActive state.'),
-        logWhisperLiveActiveEntry: log('[SttManager] Entering whisperLiveActive state.'),
-        logFallbackToIdle: log('[SttManager] Engine setting not matched, falling back to idle.'),
-        logForwardingEvent: log(({ event }) => `[SttManager] Forwarding event ${event.type} to child`),
-        sendStartToChild: sendTo(
-            ({ context }) => context.childRef!,
-            ({ context }) => ({
-                type: 'START_LISTENING',
-                payload: { token: context.apiToken }
-            })
-        ),
-        logSentStart: log('Sent START_LISTENING to child after spawning.')
+		assignStream: assign({
+			managerAudioStream: ({ event }) => {
+				const successEvent = event as DoneActorEvent<MediaStream, 'micPermissionActor'>;
+				console.log('[sttManager] Assigning active MediaStream.');
+				return successEvent.output;
+			},
+			errorMessage: null
+		}),
+		assignError: assign({
+			errorMessage: ({ event }) => {
+				console.error("[sttManager] Error event received:", event);
+				let message = 'An unknown manager error occurred';
+
+				if (event.type === 'WORKER_ERROR') {
+					message = event.error;
+				}
+				else if (isMicPermissionPlatformErrorEvent(event as SttManagerEvent | ErrorActorEvent)) {
+					const errorEvent = event as unknown as ErrorActorEvent;
+					const error = errorEvent.error;
+					if (error instanceof Error) {
+						message = error.message;
+					} else if (typeof error === 'string') {
+						message = error;
+					} else {
+						try { message = JSON.stringify(error); } catch { message = 'Unknown platform error object'; }
+					}
+				}
+				return message;
+			},
+			managerAudioStream: null,
+			activeWorker: null,
+			processingWorkers: [],
+			statusMessage: 'Error'
+		}),
+		assignPermissionDeniedError: assign({ errorMessage: 'Microphone permission denied.' }),
+		stopAllWorkersAction: ({ context }: { context: SttManagerContext }) => {
+			const workersToStop: ActorRefFrom<typeof sttMachine>[] = [];
+			if (context.activeWorker) {
+				workersToStop.push(context.activeWorker); // No cast needed now
+			}
+			workersToStop.push(...context.processingWorkers); // No cast needed now
+
+			if (workersToStop.length > 0) {
+				console.log(`[sttManager] Generating stop actions for ${workersToStop.length} workers.`);
+				return workersToStop.map(worker => stopChild(worker));
+			}
+			return [];
+		},
+		assignConfig: assign({ // Assigns only token and transcribeFn now
+			apiToken: ({ event, context }) => {
+				if (event.type === 'START_CALL') return event.payload.token ?? context.apiToken;
+				return context.apiToken;
+			},
+			transcribeFn: ({ event, context }) => {
+				if (event.type === 'START_CALL') return event.payload.transcribeFn; // Should always be provided on START_CALL
+				return context.transcribeFn; // Should retain if already set
+			}
+		}),
+		// Simplified spawnInitialWorker - always spawns sttMachine (Whisper worker)
+		spawnInitialWorker: assign({
+			activeWorker: ({ context, spawn, self }: AssignArgs<SttManagerContext, SttManagerEvent, any, any>) => {
+				if (!context.managerAudioStream || !context.managerAudioStream.active) {
+					console.error('[sttManager] Cannot spawn worker: inactive or missing audio stream.');
+					return null;
+				}
+				if (!context.apiToken || !context.transcribeFn) {
+					console.error('[sttManager] Cannot spawn whisper worker: missing apiToken or transcribeFn.');
+					return null;
+				}
+
+				console.log('[sttManager] Spawning initial Whisper worker (sttMachine)...');
+				try {
+					const worker = spawn(sttMachine, {
+						id: `sttWorker-${Date.now()}`,
+						input: {
+							parent: self,
+							audioStream: context.managerAudioStream,
+							minDecibels: context.minDecibels,
+							silenceDuration: context.silenceDuration,
+							apiToken: context.apiToken,
+							transcribeFn: context.transcribeFn
+						},
+					});
+					return worker;
+				} catch (error) {
+					console.error('[sttManager] Error spawning worker:', error);
+					return null;
+				}
+			}
+		}),
+		// Simplified handleSilenceAndSpawnNew - always spawns sttMachine (Whisper worker)
+		handleSilenceAndSpawnNew: assign({
+			activeWorker: ({ context, spawn, event, self }: AssignArgs<SttManagerContext, SttManagerEvent, any, any>) => {
+				if (event.type !== 'WORKER_SILENCE_DETECTED') return context.activeWorker;
+
+				const silencedWorker = event.workerRef;
+
+				console.log(`[sttManager] Telling worker ${silencedWorker.id} to process chunks.`);
+				sendTo(silencedWorker, { type: 'PROCESS_CHUNKS' });
+
+				if (!context.managerAudioStream || !context.managerAudioStream.active) {
+					console.error('[sttManager] Cannot spawn new worker: inactive or missing audio stream.');
+					return context.activeWorker;
+				}
+				if (!context.apiToken || !context.transcribeFn) {
+					console.error('[sttManager] Cannot spawn new whisper worker: missing apiToken or transcribeFn.');
+					return context.activeWorker;
+				}
+
+				console.log('[sttManager] Spawning new Whisper worker (sttMachine) due to silence...');
+				 try {
+					const newWorker = spawn(sttMachine, {
+						id: `sttWorker-${Date.now()}`,
+						input: {
+							parent: self,
+							audioStream: context.managerAudioStream,
+							minDecibels: context.minDecibels,
+							silenceDuration: context.silenceDuration,
+							apiToken: context.apiToken,
+							transcribeFn: context.transcribeFn
+						}
+					});
+					 return newWorker;
+				} catch (error) {
+					console.error('[sttManager] Error spawning new worker:', error);
+					return context.activeWorker;
+				}
+			},
+			processingWorkers: ({ context, event }) => {
+				if (event.type === 'WORKER_SILENCE_DETECTED') {
+					if (!context.processingWorkers.some(w => w.id === event.workerRef.id)) {
+						return [...context.processingWorkers, event.workerRef];
+					}
+				}
+				return context.processingWorkers;
+			}
+		}),
+		removeProcessedWorker: assign({
+			processingWorkers: ({ context, event }) => {
+				if (event.type === 'WORKER_TRANSCRIPTION_RESULT') {
+					console.log(`[SttManager] Removing worker ${event.workerRef.id} from processing list.`);
+					return context.processingWorkers.filter(ref => ref.id !== event.workerRef.id);
+				}
+				return context.processingWorkers;
+			}
+		}),
+		assignStoppedWorkers: assign({
+			activeWorker: null,
+			processingWorkers: []
+		}),
+		cleanupStream: ({ context }) => {
+			if (context.managerAudioStream) {
+				console.log('[sttManager] Cleaning up manager audio stream.');
+				context.managerAudioStream.getTracks().forEach(track => track.stop());
+			}
+		},
+		resetManagerContext: assign({
+			managerAudioStream: null,
+			activeWorker: null,
+			processingWorkers: [],
+			finalTranscript: '',
+			errorMessage: null,
+			apiToken: null,
+			transcribeFn: undefined,
+			isListening: false,
+			isRecording: false,
+			currentSegment: null,
+			lastFinalizedText: null,
+			statusMessage: 'Idle',
+			rmsLevel: 0,
+		}),
 	},
 	guards: {
-		isStandardMode: ({ context }) => context.sttEngineSetting === 'whisper',
-		isWhisperLiveMode: ({ context }) => context.sttEngineSetting === 'whisper-live',
-		hasChildRef: ({ context }) => context.childRef !== null
-	}
+		hasActiveStream: ({ context }) => !!context.managerAudioStream && context.managerAudioStream.active,
+		hasRequiredConfig: ({ context }) => !!context.apiToken && !!context.transcribeFn, // Now checks transcribeFn too
+		isPermissionSuccess: (context, event) => isMicPermissionSuccessEvent(event as SttManagerEvent),
+		isPermissionPlatformError: (context, event) => isMicPermissionPlatformErrorEvent(event as SttManagerEvent | ErrorActorEvent),
+		isPermissionDeniedError: (context, event) => isPermissionDeniedError(event as SttManagerEvent),
+		canSpawnNewWorker: ({ context }) => // Renamed from guard that checked engine
+			(!!context.managerAudioStream && context.managerAudioStream.active) &&
+			(!!context.apiToken && !!context.transcribeFn),
+	},
 }).createMachine({
 	id: 'sttManager',
-	context: ({ input }) => ({
-		currentMode: 'none',
-		sttEngineSetting: input?.sttEngineSetting ?? 'whisper', // Default to standard whisper
-		childRef: null,
-        childSubscription: null, // Initialize subscription field
-		apiToken: input?.apiToken ?? null,
-		transcribeFn: input?.transcribeFn,
-		// Initialize display context
-		isListening: false,
-		isRecording: false,
-		currentSegment: null,
-		lastFinalizedText: null,
-		statusMessage: 'Initializing...',
-		errorMessage: null,
-		rmsLevel: 0
-	}),
+	context: ({ input }) => {
+		console.log('[sttManagerMachine] context function executing with input:', JSON.stringify(input));
+		// Default context for Whisper Manager
+		return {
+			// currentMode removed
+			// sttEngineSetting removed
+			apiToken: input?.apiToken ?? null,
+			// transcribeFn is now required, ensure it's provided or default handled if possible
+			transcribeFn: input?.transcribeFn!, // Non-null assertion, assuming configurator ensures this
+			managerAudioStream: null,
+			minDecibels: input?.minDecibels ?? -45,
+			silenceDuration: input?.silenceDuration ?? 1500,
+			activeWorker: null,
+			processingWorkers: [],
+			finalTranscript: '',
+			// Display context defaults
+			isListening: false,
+			isRecording: false,
+			currentSegment: null,
+			lastFinalizedText: null,
+			statusMessage: 'Initializing...',
+			errorMessage: null,
+			rmsLevel: 0,
+		}
+	},
 	initial: 'idle',
 	states: {
 		idle: {
-			entry: ['resetDisplayContext', log('[SttManager] Entering idle state')],
+			entry: ['resetManagerContext', log('[SttManager] Entering idle state')],
 			on: {
-				START_LISTENING: {
-					target: 'determiningMode',
-					actions: 'assignApiToken' // Store token before determining mode
-				},
-				CONFIG_UPDATE: {
-					actions: ['assignEngineSetting', 'assignApiToken'] // Update config while idle
+				START_CALL: {
+					target: 'requestingPermission',
+					actions: [
+						log('[SttManager] START_CALL received in idle state, transitioning...'),
+						{ type: 'assignConfig' }
+					]
 				}
 			}
 		},
-		determiningMode: {
-			entry: ['logDeterminingInfo'],
+		requestingPermission: {
+			entry: log('[sttManager] Entering requestingPermission state...'),
+			invoke: {
+				id: 'micPermissionActor',
+				src: 'micPermissionActor',
+				onDone: {
+					target: 'managing',
+					actions: { type: 'assignStream' },
+					guard: ({ event }) => event.output instanceof MediaStream && event.output.active
+				},
+				onError: [
+					{
+						guard: ({ event }) => {
+							const error = event.error;
+							return error instanceof Error && (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError');
+						},
+						target: 'error',
+						actions: { type: 'assignPermissionDeniedError' }
+					},
+					{
+						guard: ({ event }) => event.type === 'xstate.error.actor.micPermissionActor',
+						target: 'error',
+						actions: { type: 'assignError' }
+					}
+				]
+			},
+			on: {
+				STOP_CALL: { target: 'idle' }
+			}
+		},
+		managing: {
+			entry: [
+				log('[sttManager] Entering managing state...'),
+				{ type: 'spawnInitialWorker' }
+			],
 			always: [
 				{
-					guard: 'isStandardMode',
-					target: 'standardActive',
-					actions: [
-                        log('[SttManager] Transitioning to standardActive...'),
-                        'spawnStandardStt',     // Assign childRef
-                        'subscribeToChild',   // Assign childSubscription
-                        'sendStartToChild',     // Send event to child
-                        'logSentStart'
-                    ]
-				},
-				{
-					guard: 'isWhisperLiveMode',
-					target: 'whisperLiveActive',
-					actions: [
-                        log('[SttManager] Transitioning to whisperLiveActive...'),
-                        'spawnWhisperLiveStt', // This still has combined assign
-                        'sendStartToChild',
-                        'logSentStart'
-                    ]
-				},
-				{
-					target: 'idle',
-					actions: 'logFallbackToIdle' // Fallback if no mode matches
+					target: 'error',
+					guard: ({ context }) => (!context.managerAudioStream || !context.managerAudioStream.active) || !context.activeWorker || !context.apiToken || !context.transcribeFn,
+					actions: assign({ errorMessage: 'Failed to initialize managing state: Invalid stream, worker spawn failed, or missing config.' })
 				}
+			],
+			on: {
+				WORKER_SILENCE_DETECTED: {
+					guard: ({ context }) =>
+						(!!context.managerAudioStream && context.managerAudioStream.active) &&
+						(!!context.apiToken && !!context.transcribeFn),
+					actions: ['handleSilenceAndSpawnNew', log('[sttManager] Handled silence, spawned new worker.')]
+				},
+				WORKER_TRANSCRIPTION_RESULT: {
+					actions: [
+						{ type: 'assignFinalizedText' },
+						'removeProcessedWorker',
+						stopChild(({ event }) => (event as { type: 'WORKER_TRANSCRIPTION_RESULT', workerRef: any }).workerRef),
+						log('[sttManager] Processed transcription result.')
+					]
+				},
+				WORKER_ERROR: {
+					target: 'error',
+					actions: [
+						{ type: 'assignChildError' },
+						stopChild(({ event }) => (event as { type: 'WORKER_ERROR', workerRef: any }).workerRef),
+						log('[sttManager] Worker error occurred, transitioning to error state.')
+					]
+				},
+				STOP_CALL: {
+					target: 'idle',
+					actions: [log('[sttManager] Stopping call.')]
+				}
+			},
+			exit: [
+				'cleanupStream',
+				'stopAllWorkersAction',
+				'assignStoppedWorkers'
 			]
 		},
-		standardActive: {
-			entry: ['logStandardActiveEntry'],
-			exit: log('[SttManager] Exiting standardActive state'),
-			// Listen for events forwarded from the child actor OR events sent directly to the manager
+		error: {
+			entry: [
+				log( ({context}) => `[SttManager] Entering error state: ${context.errorMessage}`),
+				'cleanupStream',
+				'stopAllWorkersAction',
+				'assignStoppedWorkers'
+			],
 			on: {
-				STOP_LISTENING: {
-					target: 'idle',
-					actions: ['cleanupChildActor']
+				START_CALL: {
+					target: 'requestingPermission',
+					actions: [{ type: 'resetManagerContext' }, { type: 'assignConfig' }]
 				},
 				RESET: {
-					target: 'idle',
-					actions: ['cleanupChildActor']
-				},
-				CONFIG_UPDATE: {
-					// Stop current child, go back to determining mode with new config
-					target: 'determiningMode',
-					actions: ['cleanupChildActor', 'assignEngineSetting', 'assignApiToken']
-				},
-				// Handle generic child updates (forwarded by onSnapshot)
-				CHILD_UPDATE: {
-                    actions: 'updateContextFromChild' // Handles status, errors etc. but NOT RMS
-                },
-                // Handle specific RMS update event from standard child (forwarded by onOutput)
-                _AUDIO_ANALYSIS_UPDATE: {
-                    actions: 'assignRmsLevel' // Use the new action
-                },
-                // Handle specific child errors if needed (forwarded by onOutput)
-                CHILD_ERROR: {
-                    actions: 'assignChildError'
-                },
-                // Handle finalized text (forwarded by onOutput)
-                STT_RESULT: {
-                    actions: [
-                        log('[SttManager] STT_RESULT event handler triggered in standardActive state.'),
-                        'assignFinalizedText',
-                        log('[SttManager] Sending START_LISTENING back to child after STT_RESULT.'),
-                        'sendStartToChild'
-                    ]
-                }
-			},
-            // Invoke logic removed as spawn seems to handle lifecycle and event forwarding
-		},
-		whisperLiveActive: {
-			entry: ['logWhisperLiveActiveEntry'],
-			exit: log('[SttManager] Exiting whisperLiveActive state'),
-			on: {
-				STOP_LISTENING: {
-					target: 'idle',
-					actions: ['cleanupChildActor']
-				},
-				RESET: {
-					target: 'idle',
-					actions: ['cleanupChildActor']
-				},
-				CONFIG_UPDATE: {
-					target: 'determiningMode',
-					actions: ['cleanupChildActor', 'assignEngineSetting', 'assignApiToken']
-				},
-                // Handle generic child updates (forwarded by onSnapshot)
-				CHILD_UPDATE: {
-                    actions: 'updateContextFromChild' // Handles status, errors etc.
-                },
-                // Handle specific finalized event from Whisper-Live (forwarded by onOutput)
-                CHILD_FINALIZED: {
-                    actions: 'assignFinalizedText'
-                },
-                 // Handle specific error event from Whisper-Live (forwarded by onOutput)
-                CHILD_ERROR: {
-                    actions: 'assignChildError'
-                }
+					target: 'idle'
+				}
 			}
 		}
 	}
-}); 
+});
+
+console.log('[sttManagerMachine.ts] Machine definition complete (Whisper Manager)'); 

@@ -18,8 +18,10 @@
 	import { ttsMachine, type TTSContext } from '$lib/machines/ttsMachine';
 	// Import the new Call machine
 	import { callMachine } from '$lib/machines/callMachine';
-	// Import the new STT Manager machine
-	import { sttManagerMachine, type SttManagerContext } from '$lib/machines/sttManagerMachine'; // Import Manager
+	// Import the new STT Configurator machine (Master)
+	import { sttConfiguratorMachine, type SttConfiguratorContext, type SttEngine } from '$lib/machines/sttConfiguratorMachine';
+	// Import the STT Manager Context type (for type checks on the manager's snapshot)
+	import type { SttManagerContext } from '$lib/machines/sttManagerMachine';
 	// Import the new Chat machine
 	import { chatMachine } from '$lib/machines/chatMachine'; // Import Chat Machine
 	import type { SttContext } from '$lib/machines/sttMachine'; // Import SttContext for type check
@@ -75,12 +77,13 @@
 	// Call Machine
 	const { snapshot: callSnapshot, send: sendCall } = useMachine(callMachine);
 
-	// STT Manager Machine
-	const { snapshot: sttManagerSnapshot, send: sendSttManager } = useMachine(sttManagerMachine, {
+	// STT Configurator Machine (Master)
+	const { snapshot: sttConfiguratorSnapshot, send: sendSttConfigurator } = useMachine(sttConfiguratorMachine, {
 		input: {
-			sttEngineSetting: (($config as any)?.audio?.stt?.engine || 'whisper'),
+			// Provide initial configuration from settings store
+			sttEngineSetting: (($settings as any)?.audio?.stt?.engine ?? 'whisper') as SttEngine,
 			apiToken: localStorage.token,
-			transcribeFn: transcribeAudio
+			transcribeFn: transcribeAudio // Assuming this is for Whisper
 		}
 	});
 
@@ -97,16 +100,20 @@
 	$: currentEmoji = $ttsSnapshot.context.currentEmoji;
 	$: assistantSpeaking = $ttsSnapshot.matches('speaking');
 	$: callStateValue = $callSnapshot.value;
-	$: sttManagerStateValue = $sttManagerSnapshot.value;
-	$: sttManagerContext = $sttManagerSnapshot.context;
+
+	// Get the spawned STT Manager's state from the Configurator
+	$: managerSnapshot = $sttConfiguratorSnapshot.context.managerRef?.getSnapshot();
+	$: sttManagerStateValue = managerSnapshot?.value ?? 'unknown'; // Use manager's state value
+	$: sttManagerContext = managerSnapshot?.context as SttManagerContext | undefined; // Use manager's context
+
 	// Add chat machine aliases
 	$: chatStateValue = $chatSnapshot.value;
 	$: chatContext = $chatSnapshot.context;
 	$: isChatLoading = $chatSnapshot.matches('submitting') || $chatSnapshot.context.isLoading;
 
-	// Add reactive log for UI conditions
+	// Reactive log for UI conditions (Update to use derived manager state)
 	$: {
-		// console.log(`[CallOverlay UI Check] Chat State: ${$chatSnapshot.value}, isLoading: ${$chatSnapshot.context.isLoading}, isChatLoading Var: ${isChatLoading}, callActive: ${$callSnapshot.matches('active')}, isListeningOrRecording: ${sttManagerContext.isListening || sttManagerContext.isRecording}`);
+		console.log(`[CallOverlay UI Check] Configurator: ${$sttConfiguratorSnapshot.value}, Manager: ${sttManagerStateValue}, isListening: ${sttManagerContext?.isListening}, isRecording: ${sttManagerContext?.isRecording}`);
 	}
 
 	// --- Camera Variables ---
@@ -258,28 +265,47 @@
 
 	// --- Reactive Effects ---
 
-	// Call Session Machine: Trigger activation when overlay becomes visible
+	// Call Session Activation: Trigger Configurator's START_SESSION
 	let overlayJustOpened = false;
 	$: {
-		if ($showCallOverlay && !overlayJustOpened && $callSnapshot?.matches('idle')) {
-			console.log('CallOverlay opened, activating session...');
-			sendCall({ type: 'ACTIVATE' });
+		// Read engine from settings store
+		const currentEngine = ($settings as any)?.audio?.stt?.engine as SttEngine | undefined | '';
+
+		// Log the conditions before the if statement
+		console.log(`[CallOverlay Reactive Check] Conditions: show=${$showCallOverlay}, !justOpened=${!overlayJustOpened}, isIdle=${$sttConfiguratorSnapshot?.matches('idle')}, engine='${currentEngine}' (from settings)`);
+
+		// Check if currentEngine is one of the valid, non-empty engine types
+		const isValidEngine = currentEngine === 'whisper' || currentEngine === 'web' || currentEngine === 'whisper-live';
+
+		if ($showCallOverlay && !overlayJustOpened && $sttConfiguratorSnapshot?.matches('idle') && isValidEngine) {
+			console.log(`CallOverlay opened, engine '${currentEngine}' (from settings) confirmed, starting STT session...`);
+			sendSttConfigurator({
+				type: 'START_SESSION',
+				initialConfig: {
+					sttEngineSetting: currentEngine,
+					apiToken: localStorage.token,
+					transcribeFn: transcribeAudio
+				}
+			});
 			overlayJustOpened = true;
 		} else if (!$showCallOverlay && overlayJustOpened) {
+			console.log('CallOverlay closing, stopping STT session via Configurator...');
+			sendSttConfigurator({ type: 'STOP_SESSION' });
 			overlayJustOpened = false;
 		}
 	}
 
-	// STT Manager: Handle transcription result -> Trigger Chat Machine
+	// STT Manager Result Handling (Read from derived managerSnapshot)
 	let previousFinalizedText: string | null = null;
 	$: {
-		const currentFinalizedText = $sttManagerSnapshot.context.lastFinalizedText;
+		const currentFinalizedText = sttManagerContext?.finalTranscript; // Get transcript from manager context
 		if (
-			currentFinalizedText &&
+			currentFinalizedText !== undefined && // Check for undefined (manager not ready)
+			currentFinalizedText !== null &&
 			currentFinalizedText !== previousFinalizedText &&
 			currentFinalizedText.trim() !== ''
 		) {
-			console.log('[CallOverlay] STT Manager Finalized Text:', currentFinalizedText);
+			console.log('[CallOverlay] STT Finalized Text (from Manager via Configurator):', currentFinalizedText);
 
 			// Stop any ongoing TTS before submitting new prompt
 			sendTts({ type: 'INTERRUPT' });
@@ -288,122 +314,94 @@
 			if (camera && cameraStream) {
 				const imageUrl = takeScreenshot();
 				files = imageUrl ? [{ type: 'image', url: imageUrl }] : [];
-				} else {
+		} else {
 				files = [];
 			}
 
 			// Submit the finalized text via Chat Machine
-			// loading = true; // Remove local loading
 			console.log('[CallOverlay] Sending SUBMIT_PROMPT to chatMachine...');
 			sendChat({ type: 'SUBMIT_PROMPT', payload: { prompt: currentFinalizedText } });
 
 		} else if (
-			currentFinalizedText === '' && // Handle explicitly empty finalized text (e.g., silence in standard mode)
+			currentFinalizedText === '' && // Handle explicitly empty finalized text
 			previousFinalizedText !== '' // Check if it just became empty
 		) {
 			files = [];
 			console.log('[CallOverlay] Empty transcription result received.');
 			toast.info("Couldn't hear anything clearly.");
 		}
-		previousFinalizedText = currentFinalizedText;
-	}
-
-	// Wire up MediaRecorder events from the active STT child machine context
-	$: {
-		const childSnapshot = $sttManagerSnapshot.context.childRef?.getSnapshot();
-		// Check if the child is the standard STT machine and has a mediaRecorder
-		if (
-			$sttManagerSnapshot.matches('standardActive') &&
-			childSnapshot?.context &&
-			'mediaRecorder' in childSnapshot.context // Type guard
-		) {
-			const recorder = (childSnapshot.context as SttContext).mediaRecorder;
-			if (recorder) {
-				recorder.ondataavailable = (event: BlobEvent) => {
-					// Send data available event back TO THE CHILD machine
-					// We need the childRef to send the event directly to it
-					const childActorRef = $sttManagerSnapshot.context.childRef;
-					if (event.data.size > 0 && childActorRef && childSnapshot.matches('recording')) { // Check child state
-						console.log(`[CallOverlay] Sending RECORDING_DATA_AVAILABLE to child, size: ${event.data.size}`);
-						childActorRef.send({ type: 'RECORDING_DATA_AVAILABLE', data: event.data });
-					}
-				};
-				recorder.onstop = () => {
-					// This might be handled internally by sttMachine already, log for confirmation
-					console.log('[CallOverlay] MediaRecorder stopped (native onstop). Child State:', childSnapshot?.value);
-					// Optionally send STOP event to child? Depends on sttMachine logic.
-				};
-				 recorder.onstart = () => {
-					 console.log('[CallOverlay] MediaRecorder started (native onstart). Child State:', childSnapshot?.value);
-				 };
-				 recorder.onerror = (event: Event) => {
-					 console.error('[CallOverlay] MediaRecorder error:', event);
-					 // Send error to child?
-					 const childActorRef = $sttManagerSnapshot.context.childRef;
-					 if (childActorRef) {
-						 // Assuming sttMachine handles a generic error event or a specific recorder error
-						 childActorRef.send({ type: 'RECORDER_ERROR', error: (event as any).error || 'Unknown recorder error' });
-					 }
-				 };
-			}
+		// Only update previous text if it was successfully read
+		if (currentFinalizedText !== undefined) {
+			previousFinalizedText = currentFinalizedText;
 		}
-		// Potential cleanup needed if the recorder instance changes or disappears?
-		// This $: block will re-run, potentially re-attaching listeners.
-		// Proper cleanup might involve tracking the recorder instance and removing listeners in onDestroy or when the instance changes.
 	}
 
-	// Call State Controlled STT Start/Stop (Using STT Manager)
+	// Call State Controlled STT Start/Stop (Using STT Configurator)
 	let previousCallState = $callSnapshot.value;
 	$: {
 		if (previousCallState !== 'active' && $callSnapshot.matches('active')) {
-			// Call became active, start STT Manager
-			console.log('[CallOverlay] Call active, starting STT Manager...');
-			sendSttManager({ type: 'START_LISTENING', payload: { token: localStorage.token } });
+			// Call became active, tell Configurator (which forwards START_CALL to manager)
+			console.log('[CallOverlay] Call active, sending START_CALL via Configurator...');
+			if ($sttConfiguratorSnapshot.matches('active')) { // Only if configurator is active
+				sendSttConfigurator({ type: 'START_CALL' });
+				} else {
+				console.warn('[CallOverlay] Call became active, but STT Configurator is not ready.');
+			}
 		} else if (previousCallState === 'active' && !$callSnapshot.matches('active')) {
-			// Call is no longer active, stop STT Manager
-			console.log('[CallOverlay] Call inactive, stopping STT Manager...');
-			sendSttManager({ type: 'STOP_LISTENING' }); // Or RESET
-			sendSttManager({ type: 'RESET' }); // Reset the manager fully
+			// Call is no longer active, tell Configurator (which forwards STOP_CALL and can trigger STOP_SESSION)
+			console.log('[CallOverlay] Call inactive, sending STOP_CALL via Configurator...');
+			if ($sttConfiguratorSnapshot.matches('active')) {
+				sendSttConfigurator({ type: 'STOP_CALL' });
+				// Optionally also send STOP_SESSION if call ending means STT should fully stop
+				// sendSttConfigurator({ type: 'STOP_SESSION' });
+			} else {
+				console.warn('[CallOverlay] Call became inactive, but STT Configurator was not active.');
+			}
 		}
 		previousCallState = $callSnapshot.value;
 	}
 
-	// Reactive effect for STT engine config changes (using $:)
-	let currentEngineSetting = ($config as any)?.audio?.stt?.engine ?? 'whisper'; // Cast to any
+	// Reactive effect for STT engine config changes (Send CONFIG_UPDATE to Configurator)
+	// Now monitor $settings store for changes
+	let currentEngineSetting = ($settings as any)?.audio?.stt?.engine ?? 'whisper';
 	$: {
-		const newEngine = ($config as any)?.audio?.stt?.engine ?? 'whisper'; // Cast to any
+		const newEngine = ($settings as any)?.audio?.stt?.engine ?? 'whisper'; // Read from settings
 		if (newEngine && newEngine !== currentEngineSetting) {
-			console.log(`[CallOverlay] STT Engine changed from ${currentEngineSetting} to ${newEngine}. Sending CONFIG_UPDATE.`);
-			sendSttManager({
+			console.log(`[CallOverlay] STT Engine changed in settings from ${currentEngineSetting} to ${newEngine}. Sending CONFIG_UPDATE to Configurator.`);
+			sendSttConfigurator({
 				type: 'CONFIG_UPDATE',
 				settings: {
-					sttEngine: newEngine,
-					token: localStorage.token // Re-send token
+					sttEngineSetting: newEngine as SttEngine,
+					// Also re-send other potentially needed config
+					apiToken: localStorage.token,
+					transcribeFn: transcribeAudio
 				}
 			});
-			currentEngineSetting = newEngine; // Update current setting after sending event
+			currentEngineSetting = newEngine;
 		}
 	}
 
-	// Reactive effect for token changes (using $:)
+	// Reactive effect for token changes (Send CONFIG_UPDATE to Configurator)
 	let currentToken = localStorage.token;
 	$: {
 		const newToken = localStorage.token;
 		if (newToken && newToken !== currentToken) {
-			console.log(`[CallOverlay] API Token changed. Sending CONFIG_UPDATE.`);
-			sendSttManager({
+			console.log(`[CallOverlay] API Token changed. Sending CONFIG_UPDATE to Configurator.`);
+			sendSttConfigurator({
 				type: 'CONFIG_UPDATE',
 				settings: {
-					sttEngine: ($config as any)?.audio?.stt?.engine ?? 'whisper', // Cast to any
-					token: newToken
+					apiToken: newToken
+					// Optionally re-send engine and transcribeFn if they might depend on the token indirectly
+					// sttEngineSetting: currentEngineSetting as SttEngine,
+					// transcribeFn: transcribeAudio
 				}
 			});
-			// Also update TTS machine token
+			// Also update TTS machine token (remains the same)
 			sendTts({
 				type: 'UPDATE_CONFIG',
 				config: { apiConfig: { token: newToken, modelId, chatId } }
 			});
-			currentToken = newToken; // Update current token after sending events
+			currentToken = newToken;
 		}
 	}
 
@@ -446,31 +444,54 @@
 		eventTarget.addEventListener('chat', chatEventHandler);
 		eventTarget.addEventListener('chat:finish', chatFinishHandler);
 
-		// Cleanup function (no return needed from onMount in Svelte 5+)
+		// Start the STT session when component mounts if overlay is shown and config is ready
+		if ($showCallOverlay) {
+			// Read initial engine from settings store
+			const initialEngine = ($settings as any)?.audio?.stt?.engine as SttEngine | undefined | '';
+			const isValidInitialEngine = initialEngine === 'whisper' || initialEngine === 'web' || initialEngine === 'whisper-live';
+
+			if (isValidInitialEngine) {
+				console.log(`[CallOverlay onMount] Overlay shown, engine '${initialEngine}' (from settings) confirmed, starting STT session...`);
+				sendSttConfigurator({
+					type: 'START_SESSION',
+					initialConfig: {
+						sttEngineSetting: initialEngine,
+						apiToken: localStorage.token,
+						transcribeFn: transcribeAudio
+					}
+				});
+				overlayJustOpened = true; // Set flag to prevent immediate re-trigger in reactive block
+			} else {
+				 console.warn(`[CallOverlay onMount] Overlay shown, but initial engine config ('${initialEngine}' from settings) is not valid/ready yet. Session will start when config updates.`);
+			}
+		}
 	});
 
 	onDestroy(() => {
 		console.log('CallOverlay unmounting - cleanup initiated');
 
-		// Stop/Reset STT Manager
-		sendSttManager({ type: 'STOP_LISTENING' });
-		sendSttManager({ type: 'RESET' });
+		// Stop STT Session via Configurator
+		sendSttConfigurator({ type: 'STOP_SESSION' });
 
+		// Stop TTS (remains the same)
 		sendTts({ type: 'INTERRUPT' });
 		sendTts({ type: 'RESET' });
 
+		// Stop camera (remains the same)
 		stopCamera();
 
+		// Remove chat listeners (remain the same)
 		eventTarget.removeEventListener('chat:start', chatStartHandler);
 		eventTarget.removeEventListener('chat', chatEventHandler);
 		eventTarget.removeEventListener('chat:finish', chatFinishHandler);
 
+		// Release Wake Lock (remains the same)
 		if (wakeLock) {
 			wakeLock.release().catch((e: any) => console.error("Error releasing wake lock on destroy:", e));
 			wakeLock = null;
 		}
 
-		// Reset chat machine on destroy?
+		// Reset chat machine (remains the same)
 		sendChat({ type: 'RESET' });
 	});
 
@@ -489,24 +510,24 @@
 				title={assistantSpeaking ? $i18n.t('Tap to interrupt') : ''}
 			>
 				{#if currentEmoji}
-					<!-- Emoji display -->
+					<!-- Emoji display (Update to use derived manager state) -->
 					<div
 						class="transition-all rounded-full text-center"
-						style="font-size:{sttManagerContext.rmsLevel * 100 > 4 ? '4.5' : sttManagerContext.rmsLevel * 100 > 2 ? '4.25' : sttManagerContext.rmsLevel * 100 > 1 ? '3.75' : '3.5'}rem; width: 100%;"
+						style="font-size:{sttManagerContext?.rmsLevel * 100 > 4 ? '4.5' : sttManagerContext?.rmsLevel * 100 > 2 ? '4.25' : sttManagerContext?.rmsLevel * 100 > 1 ? '3.75' : '3.5'}rem; width: 100%;"
 					>
 						{currentEmoji}
 					</div>
-				{:else if isChatLoading || assistantSpeaking || $ttsSnapshot.matches('fetchingAudio') || sttManagerContext.isRecording}
-					<!-- Spinner display -->
+				{:else if isChatLoading || assistantSpeaking || $ttsSnapshot.matches('fetchingAudio') || sttManagerContext?.isRecording}
+					<!-- Spinner display (Update to use derived manager state) -->
 					<svg
-						class="size-12 {isChatLoading ? 'text-gray-900 dark:text-gray-400' : assistantSpeaking ? 'text-green-500' : sttManagerContext.isRecording ? 'text-red-500' : 'text-blue-500'}"
+						class="size-12 {isChatLoading ? 'text-gray-900 dark:text-gray-400' : assistantSpeaking ? 'text-green-500' : sttManagerContext?.isRecording ? 'text-red-500' : 'text-blue-500'}"
 						viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
 						<style>.spinner_qM83{animation:spinner_8HQG 1.05s infinite}.spinner_oXPr{animation-delay:.1s}.spinner_ZTLf{animation-delay:.2s}@keyframes spinner_8HQG{0%,57.14%{animation-timing-function:cubic-bezier(.33,.66,.66,1);transform:translate(0)}28.57%{animation-timing-function:cubic-bezier(.33,0,.66,.33);transform:translateY(-6px)}100%{transform:translate(0)}}</style><circle class="spinner_qM83" cx="4" cy="12" r="3"/><circle class="spinner_qM83 spinner_oXPr" cx="12" cy="12" r="3"/><circle class="spinner_qM83 spinner_ZTLf" cx="20" cy="12" r="3"/>
 					</svg>
 				{:else}
-					<!-- Profile image / Listening indicator (based on STT Manager context) -->
+					<!-- Profile image / Listening indicator (Update to use derived manager state) -->
 					<div
-						class="transition-all rounded-full bg-cover bg-center bg-no-repeat {sttManagerContext.isListening ? 'ring-2 ring-blue-500 ring-offset-2 dark:ring-offset-gray-800' : ''} {sttManagerContext.rmsLevel * 100 > 4 ? ' size-[4.5rem]' : sttManagerContext.rmsLevel * 100 > 2 ? ' size-16' : sttManagerContext.rmsLevel * 100 > 1 ? 'size-14' : 'size-12'} {(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? '' : 'bg-black dark:bg-white'}"
+						class="transition-all rounded-full bg-cover bg-center bg-no-repeat {sttManagerContext?.isListening ? 'ring-2 ring-blue-500 ring-offset-2 dark:ring-offset-gray-800' : ''} {sttManagerContext?.rmsLevel * 100 > 4 ? ' size-[4.5rem]' : sttManagerContext?.rmsLevel * 100 > 2 ? ' size-16' : sttManagerContext?.rmsLevel * 100 > 1 ? 'size-14' : 'size-12'} {(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? '' : 'bg-black dark:bg-white'}"
 						style={(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png'
 							? `background-image: url('${model?.info?.meta?.profile_image_url}');`
 							: ''}
@@ -526,29 +547,29 @@
 					title={assistantSpeaking ? $i18n.t('Tap to interrupt') : ''}
 				>
 					{#if currentEmoji}
-						<!-- Emoji display -->
+						<!-- Emoji display (Update to use derived manager state) -->
 						<div
 							class="transition-all rounded-full text-center"
-							style="font-size:{sttManagerContext.rmsLevel * 100 > 4 ? '13' : sttManagerContext.rmsLevel * 100 > 2 ? '12' : sttManagerContext.rmsLevel * 100 > 1 ? '11.5' : '11'}rem; width:100%;"
+							style="font-size:{sttManagerContext?.rmsLevel * 100 > 4 ? '13' : sttManagerContext?.rmsLevel * 100 > 2 ? '12' : sttManagerContext?.rmsLevel * 100 > 1 ? '11.5' : '11'}rem; width:100%;"
 						>
 							{currentEmoji}
 						</div>
 					{:else if isChatLoading || assistantSpeaking || $ttsSnapshot.matches('fetchingAudio')}
-						<!-- Loading/Thinking spinner (large) -->
+						<!-- Loading/Thinking spinner (large) (remains the same) -->
 						<svg class="size-44 {isChatLoading ? 'text-gray-900 dark:text-gray-400' : 'text-blue-500'}" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
 							<style>.spinner_qM83{animation:spinner_8HQG 1.05s infinite}.spinner_oXPr{animation-delay:.1s}.spinner_ZTLf{animation-delay:.2s}@keyframes spinner_8HQG{0%,57.14%{animation-timing-function:cubic-bezier(.33,.66,.66,1);transform:translate(0)}28.57%{animation-timing-function:cubic-bezier(.33,0,.66,.33);transform:translateY(-6px)}100%{transform:translate(0)}}</style><circle class="spinner_qM83" cx="4" cy="12" r="3"/><circle class="spinner_qM83 spinner_oXPr" cx="12" cy="12" r="3"/><circle class="spinner_qM83 spinner_ZTLf" cx="20" cy="12" r="3"/>
 						</svg>
 					{:else}
-						<!-- Profile image / Listening indicator (based on STT Manager context) -->
+						<!-- Profile image / Listening indicator (Update to use derived manager state) -->
 						<div
-							class="transition-all rounded-full bg-cover bg-center bg-no-repeat {sttManagerContext.isListening ? 'ring-4 ring-blue-500 ring-offset-4 dark:ring-offset-gray-800' : ''} {sttManagerContext.rmsLevel * 100 > 4 ? ' size-52' : sttManagerContext.rmsLevel * 100 > 2 ? 'size-48' : sttManagerContext.rmsLevel * 100 > 1 ? 'size-44' : 'size-40'} {(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? '' : 'bg-black dark:bg-white'}"
+							class="transition-all rounded-full bg-cover bg-center bg-no-repeat {sttManagerContext?.isListening ? 'ring-4 ring-blue-500 ring-offset-4 dark:ring-offset-gray-800' : ''} {sttManagerContext?.rmsLevel * 100 > 4 ? ' size-52' : sttManagerContext?.rmsLevel * 100 > 2 ? 'size-48' : sttManagerContext?.rmsLevel * 100 > 1 ? 'size-44' : 'size-40'} {(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? '' : 'bg-black dark:bg-white'}"
 							style={(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png'
 								? `background-image: url('${model?.info?.meta?.profile_image_url}');`
 								: ''}
 						/>
 					{/if}
-					{#if sttManagerContext.isListening || sttManagerContext.isRecording}
-						<!-- Microphone Icon Overlay when Listening/Recording (based on STT Manager context) -->
+					{#if sttManagerContext?.isListening || sttManagerContext?.isRecording}
+						<!-- Microphone Icon Overlay (Update to use derived manager state) -->
 						<div class="absolute inset-0 flex justify-center items-center">
 							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="size-16 text-white/80 drop-shadow-lg">
 								<path d="M8.25 4.5a3.75 3.75 0 1 1 7.5 0v8.25a3.75 3.75 0 1 1-7.5 0V4.5Z" />
@@ -567,8 +588,8 @@
 							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="size-6"><path d="M5.28 4.22a.75.75 0 0 0-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 1 0 1.06 1.06L8 9.06l2.72 2.72a.75.75 0 1 0 1.06-1.06L9.06 8l2.72-2.72a.75.75 0 0 0-1.06-1.06L8 6.94 5.28 4.22Z" /></svg>
 						</button>
 					</div>
-					<!-- Display current segment from STT Manager -->
-					{#if sttManagerContext.currentSegment}
+					<!-- Display current segment from derived manager state -->
+					{#if sttManagerContext?.currentSegment}
 					<div class="absolute bottom-4 left-4 right-4 bg-black/50 backdrop-blur-sm text-white text-center p-2 rounded-lg text-sm">
 						{sttManagerContext.currentSegment}
 					</div>
@@ -596,16 +617,16 @@
 				{/if}
 			</div>
 
-			<!-- Center Status Text -->
+			<!-- Center Status Text (Update to use derived manager state) -->
 			<div class="text-center min-w-0 flex-1 px-2">
 				<button class="cursor-default truncate w-full" on:click={() => { if (assistantSpeaking) sendTts({ type: 'INTERRUPT' }) }}>
 					<div class=" line-clamp-1 text-sm font-medium">
-						{#if sttManagerContext.isListening || sttManagerContext.isRecording}
+						{#if sttManagerContext?.isListening || sttManagerContext?.isRecording}
 							{$i18n.t('Listening...')}
 						{:else if $callSnapshot.matches('error')}
 							<span class="text-red-500">{$i18n.t('Call Error')}: {$callSnapshot.context.errorMessage ?? 'Unknown'}</span>
-						{:else if sttManagerContext.errorMessage}
-							<span class="text-red-500">{$i18n.t('STT Error')}: {sttManagerContext.errorMessage}</span>
+						{:else if $sttConfiguratorSnapshot.matches('error') || sttManagerContext?.errorMessage}
+							<span class="text-red-500">{$i18n.t('STT Error')}: {$sttConfiguratorSnapshot.context.errorMessage ?? sttManagerContext?.errorMessage ?? 'Unknown'}</span>
 						{:else if $chatSnapshot.matches('error')}
 							<span class="text-red-500">{$i18n.t('Chat Error')}: {$chatSnapshot.context.errorMessage ?? 'Unknown'}</span>
 						{:else if isChatLoading}
@@ -614,30 +635,32 @@
 							{$i18n.t('Tap to interrupt')}
 						{:else if $ttsSnapshot.matches('fetchingAudio')}
 							{$i18n.t('Preparing audio...')}
-						{:else if $callSnapshot.matches('active')}
+						{:else if $sttConfiguratorSnapshot.matches('active') && $callSnapshot.matches('active')}
 							{$i18n.t('Ready')}
+						{:else if $sttConfiguratorSnapshot.matches('idle')}
+							{$i18n.t('Initializing STT...')}
 						{:else}
 							{model?.name ?? $i18n.t('Initializing...')}
 						{/if}
 					</div>
 				</button>
-				<!-- Display current segment when not in camera view -->
+				<!-- Display current segment when not in camera view (Update to use derived manager state) -->
 				{#if !camera}
-                    {#if $chatSnapshot.context.currentResponseContent}
-                        <p class="text-sm text-gray-500 dark:text-gray-400 mt-1 truncate">
-                            { $chatSnapshot.context.currentResponseContent }
-                        </p>
-                    {:else if sttManagerContext.currentSegment}
-                        <p class="text-sm text-gray-500 dark:text-gray-400 mt-1 truncate">
-                            {sttManagerContext.currentSegment}
-                        </p>
-                    {/if}
-                {/if}
+					{#if $chatSnapshot.context.currentResponseContent}
+						<p class="text-sm text-gray-500 dark:text-gray-400 mt-1 truncate">
+							{ $chatSnapshot.context.currentResponseContent }
+						</p>
+					{:else if sttManagerContext?.currentSegment}
+						<p class="text-sm text-gray-500 dark:text-gray-400 mt-1 truncate">
+							{sttManagerContext.currentSegment}
+						</p>
+					{/if}
+				{/if}
 			</div>
 
-			<!-- Right Button: Close Overlay -->
+			<!-- Right Button: Close Overlay (Send STOP_SESSION to Configurator) -->
 			<div>
-				<button class=" p-3 rounded-full bg-red-500 text-white hover:bg-red-600 transition-colors" title="End Call" on:click={() => { sendSttManager({ type: 'STOP_LISTENING' }); sendSttManager({ type: 'RESET' }); sendTts({ type: 'INTERRUPT' }); sendTts({ type: 'RESET' }); showCallOverlay.set(false); dispatch('close'); }} type="button">
+				<button class=" p-3 rounded-full bg-red-500 text-white hover:bg-red-600 transition-colors" title="End Call" on:click={() => { sendSttConfigurator({ type: 'STOP_SESSION' }); sendTts({ type: 'INTERRUPT' }); sendTts({ type: 'RESET' }); showCallOverlay.set(false); dispatch('close'); }} type="button">
 					<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="size-5"><path fill-rule="evenodd" d="M1.5 4.5a3 3 0 0 1 3-3h1.372c.86 0 1.61.586 1.819 1.42l1.105 4.423a1.875 1.875 0 0 1-.694 1.955l-1.293.97c-.135.101-.164.29-.077.431 1.57 2.796 4.03 5.256 6.827 6.827.14.086.33.057.43-.078l.97-1.293a1.875 1.875 0 0 1 1.955-.694l4.423 1.105c.834.209 1.42.959 1.42 1.82V19.5a3 3 0 0 1-3 3h-2.25C8.552 22.5 1.5 15.448 1.5 6.75V4.5Z" clip-rule="evenodd" /></svg>
 				</button>
 			</div>

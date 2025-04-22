@@ -25,7 +25,10 @@ export async function handleCallButtonClick(
 	const $settings = settingsValue;
 	const $TTSWorker = ttsWorkerValue;
 
+	console.log('settings', $settings?.audio?.stt?.engine);
+
 	if (!($config && $settings)) {
+
 		// Handle cases where config or settings might be undefined initially
 		toast.error($i18n.t('Configuration not loaded yet.'));
 		return;

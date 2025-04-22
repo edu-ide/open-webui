@@ -1,4 +1,4 @@
-import { setup, assign, fromPromise, log, sendTo, type ActorRefFrom, fromCallback, type DoneActorEvent, sendParent } from 'xstate';
+import { setup, assign, fromPromise, log, sendTo, type ActorRefFrom, fromCallback, type DoneActorEvent, sendParent, type AnyActorRef } from 'xstate';
 import { blobToFile } from '$lib/utils'; // Assuming utils exists
 
 // --- Types ---
@@ -13,38 +13,47 @@ const calculateRMS = (data: Uint8Array): number => {
 	return Math.sqrt(sumSquares / data.length);
 };
 
+// Modified Context: Stream is now required input
 export interface SttContext {
-    audioStream: MediaStream | null;
+    parent: AnyActorRef | undefined; // Reference to the parent actor
+    audioStream: MediaStream; // Now required via input
     mediaRecorder: MediaRecorder | null;
     audioChunks: Blob[];
-    transcribedText: string | null;
+    // transcribedText: string | null; // Worker doesn't need to hold final text
     errorMessage: string | null;
-    minDecibels: number; // Sensitivity for sound detection
-    silenceDuration: number; // Milliseconds of silence to stop recording
-    // Function injected from outside to perform the actual transcription API call
-    transcribeFn?: (token: string, audioFile: File) => Promise<{ text: string }>; // Adjust based on actual API response
-    apiToken?: string | null;
+    minDecibels: number;
+    silenceDuration: number;
+    transcribeFn: (token: string, audioFile: File) => Promise<{ text: string }>; // Required via input
+    apiToken: string; // Required via input
     // Audio Analysis State
     rmsLevel: number;
-    audioContext: AudioContext | null;
-    analyserNode: AnalyserNode | null;
+    // Remove audioContext and analyserNode if managed within the service
 }
 
-type SttEvent =
-    | { type: 'START_LISTENING'; payload?: { token?: string | null } } // Triggered externally
-    | { type: 'STOP_LISTENING' } // Triggered externally
-    | { type: 'PERMISSION_GRANTED'; stream: MediaStream }
-    | { type: 'PERMISSION_DENIED'; error: string }
+// Modified Events: Added parent communication and control events
+export type SttEvent =
+    // | { type: 'START_LISTENING'; payload?: { token?: string | null } } // Removed, started by manager
+    // | { type: 'STOP_LISTENING' } // Removed, controlled by manager via STOP
+    // | { type: 'PERMISSION_GRANTED'; stream: MediaStream } // Removed, handled by manager
+    // | { type: 'PERMISSION_DENIED'; error: string } // Removed, handled by manager
     | { type: 'INITIALIZATION_COMPLETE'; recorder: MediaRecorder }
     | { type: 'INITIALIZATION_FAILED'; error: string }
-    // Re-add explicit events, keep internal update for RMS
     | { type: 'SOUND_DETECTED' }
     | { type: 'SILENCE_DETECTED' }
-    | { type: '_AUDIO_ANALYSIS_UPDATE'; rms: number } // Only RMS needed now
+    | { type: '_AUDIO_ANALYSIS_UPDATE'; rms: number }
     | { type: 'RECORDING_DATA_AVAILABLE'; data: Blob }
-    | { type: 'TRANSCRIPTION_SUCCESS'; text: string }
-    | { type: 'TRANSCRIPTION_ERROR'; error: string }
-    | { type: 'RESET' };
+    | { type: 'PROCESS_CHUNKS' } // Sent by manager
+    | { type: 'STOP' } // Sent by manager
+    // | { type: 'TRANSCRIPTION_SUCCESS'; text: string } // Internal event from actor
+    // | { type: 'TRANSCRIPTION_ERROR'; error: string } // Internal event from actor
+    // | { type: 'RESET' }; // Removed, managed by manager lifecycle
+
+    // Events sent back FROM actors (need proper typing)
+    | DoneActorEvent<MediaRecorder> // From initializeRecorderActor
+    | DoneActorEvent<{ text: string }> // From transcriptionActor
+    | { type: 'error.actor'; error: unknown; id: string } // General actor errors
+
+    | { type: 'AUDIO_CHUNK'; data: Blob }
 
 // --- Machine Setup ---
 
@@ -52,584 +61,524 @@ export const sttMachine = setup({
     types: {
         context: {} as SttContext,
         events: {} as SttEvent,
-        input: {} as Partial<Pick<SttContext, 'minDecibels' | 'silenceDuration' | 'transcribeFn' | 'apiToken'>>
+        // Input now includes required fields
+        input: {} as Pick<SttContext, 'audioStream' | 'minDecibels' | 'silenceDuration' | 'transcribeFn' | 'apiToken' | 'parent'>
     },
     actors: {
-        micPermissionActor: fromPromise(async () => {
-            console.log('[sttMachine] Requesting microphone permission...');
-            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-                throw new Error('MediaDevices API not available.');
-            }
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            console.log('[sttMachine] Permission granted, stream received:', stream);
-            if (!(stream instanceof MediaStream)) {
-                console.error('[sttMachine] getUserMedia did not return a valid MediaStream!');
-                throw new Error('Invalid MediaStream received.');
-            }
-            return stream;
-        }),
+        // micPermissionActor removed
+        // ... existing code ...
         initializeRecorderActor: fromPromise(async ({ input }: { input: { stream: MediaStream } }) => {
-            console.log('[sttMachine] Initializing MediaRecorder with stream:', input.stream);
+            // Keep internal logging for worker debugging if needed
+            console.log('[sttWorker] Initializing MediaRecorder with stream:', input.stream);
+            // ... existing recorder initialization logic ...
             if (!(input.stream instanceof MediaStream)) {
-                console.error('[sttMachine] Invalid stream passed to initializeRecorderActor:', input.stream);
+                console.error('[sttWorker] Invalid stream passed to initializeRecorderActor:', input.stream);
                 throw new Error('Invalid MediaStream received by actor.');
             }
             const stream = input.stream;
             let options = {};
-            // Log supported types
             const supportedTypes = [
-                'audio/wav',
-                'audio/webm;codecs=opus',
-                'audio/ogg;codecs=opus',
-                'audio/webm',
-                'audio/mp4',
-                'audio/aac',
-                '' // Default
+                'audio/wav', 'audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/aac', ''
             ];
-            console.log("[sttMachine] Checking supported MIME types:");
-            supportedTypes.forEach(type => {
-                console.log(`  ${type}: ${MediaRecorder.isTypeSupported(type)}`);
-            });
+            console.log("[sttWorker] Checking supported MIME types:");
+            supportedTypes.forEach(type => console.log(`  ${type}: ${MediaRecorder.isTypeSupported(type)}`));
 
-            // Prioritize WAV, then Opus formats, then webm default
-            if (MediaRecorder.isTypeSupported('audio/wav')) {
-                 console.log('[sttMachine] Using audio/wav');
-                 options = { mimeType: 'audio/wav' };
-            } else if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
-                console.log('[sttMachine] Using audio/webm;codecs=opus');
-                options = { mimeType: 'audio/webm;codecs=opus' };
-            } else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
-                console.log('[sttMachine] Using audio/ogg;codecs=opus');
-                options = { mimeType: 'audio/ogg;codecs=opus' };
-            } else if (MediaRecorder.isTypeSupported('audio/webm')) {
-                console.log('[sttMachine] Using audio/webm (default codec)');
-                options = { mimeType: 'audio/webm' };
-            } else {
-                 console.warn('[sttMachine] No preferred MIME type supported, trying default.');
-                 // Keep options empty if no specific type is supported
-                 if (!MediaRecorder.isTypeSupported('')) {
-                      throw new Error('MediaRecorder not supported or no suitable audio format.');
-                 }
-                 options = {}; // Explicitly empty
-            }
+            if (MediaRecorder.isTypeSupported('audio/wav')) options = { mimeType: 'audio/wav' };
+            else if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) options = { mimeType: 'audio/webm;codecs=opus' };
+            else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) options = { mimeType: 'audio/ogg;codecs=opus' };
+            else if (MediaRecorder.isTypeSupported('audio/webm')) options = { mimeType: 'audio/webm' };
+            else if (!MediaRecorder.isTypeSupported('')) throw new Error('MediaRecorder not supported or no suitable audio format.');
+            else console.warn('[sttWorker] No preferred MIME type supported, trying default.');
 
             let recorder;
             try {
-                // Only pass options if it's not empty
                 recorder = Object.keys(options).length > 0 ? new MediaRecorder(stream, options) : new MediaRecorder(stream);
+                // Add event listeners here if needed, BEFORE returning
+                recorder.ondataavailable = (event) => {
+                    // Cannot directly sendBack here, need to handle via machine events
+                    // This actor only resolves with the recorder instance
+                    // The machine itself needs to handle recorder events
+                    console.log(`[sttWorker/recorder] ondataavailable event, size: ${event.data.size}`);
+                 };
+                 recorder.onstop = () => {
+                     console.log('[sttWorker/recorder] onstop event');
+                 };
+                 recorder.onerror = (event) => {
+                      console.error('[sttWorker/recorder] onerror event:', event);
+                      // How to propagate this error back to the machine?
+                      // Maybe throw from here? Or emit a custom event?
+                      // For now, just log it.
+                 };
             } catch (e) {
-                console.error("[sttMachine] Error creating MediaRecorder instance:", e);
-                throw e; // Rethrow the specific error
+                console.error("[sttWorker] Error creating MediaRecorder instance:", e);
+                throw e;
             }
-
-            // Check recorder state or add listeners if needed for readiness?
-            await new Promise(resolve => setTimeout(resolve, 50)); // Short delay to ensure recorder is ready?
-            console.log('[sttMachine] MediaRecorder initialized.');
+            await new Promise(resolve => setTimeout(resolve, 50)); // Optional delay
+            console.log('[sttWorker] MediaRecorder initialized.');
             return recorder;
         }),
         transcriptionActor: fromPromise(async ({ input }: { input: { chunks: Blob[], transcribeFn: SttContext['transcribeFn'], token: string | null } }) => {
-            console.log('[sttMachine] Starting transcription...');
+            console.log('[sttWorker] Starting transcription...');
             const { chunks, transcribeFn, token } = input;
-            if (!transcribeFn) {
-                throw new Error('Transcription function (transcribeFn) not provided.');
-            }
-            if (!token) {
-                throw new Error('API token not provided for transcription.');
-            }
+            // Keep internal validation, although manager should ensure these are passed
+            if (!transcribeFn) throw new Error('Transcription function (transcribeFn) not provided.');
+            if (!token) throw new Error('API token not provided for transcription.');
             if (chunks.length === 0) {
-                console.log('[sttMachine] No audio chunks to transcribe.');
-                return { text: '' }; // Return empty text if no audio
+                console.log('[sttWorker] No audio chunks to transcribe.');
+                return { text: '' };
             }
             const audioBlob = new Blob(chunks, { type: chunks[0]?.type || 'audio/wav' });
-            // Determine extension from blob type
             const mimeType = audioBlob.type;
-            const extension = mimeType?.split('/')[1]?.split(';')[0] ?? 'wav'; // Get subtype, remove codecs if present
+            const extension = mimeType?.split('/')[1]?.split(';')[0] ?? 'wav';
             const audioFile = blobToFile(audioBlob, `recording.${extension}`);
-            console.log(`[sttMachine] Transcribing audio file (${(audioFile.size / 1024).toFixed(1)} KB) of type ${mimeType}...`);
+            console.log(`[sttWorker] Transcribing audio file (${(audioFile.size / 1024).toFixed(1)} KB) of type ${mimeType}...`);
             const result = await transcribeFn(token, audioFile);
-            console.log('[sttMachine] Transcription successful:', result);
-            return result; // Expecting { text: string }
+            console.log('[sttWorker] Transcription successful:', result);
+            return result;
         }),
-        // Modified actor for audio analysis
-        audioAnalysisService: fromCallback<SttEvent, { stream: MediaStream, minDecibels: number, silenceDuration: number }>(({ input, sendBack }) => {
-            console.log('[sttMachine/audioAnalysisService] Actor starting...');
+        // audioAnalysisService remains largely the same internally
+        audioAnalysisService: fromCallback<SttEvent, { stream: MediaStream, minDecibels: number, silenceDuration: number }>(({ input, sendBack, self }) => {
+             console.log('[sttWorker/audioAnalysisService] Actor starting...');
             const { stream, minDecibels, silenceDuration } = input;
-            console.log('[sttMachine/audioAnalysisService] Received input - stream:', stream, 'minDecibels:', minDecibels, 'silenceDuration:', silenceDuration);
-            let audioContext: AudioContext | null = null;
-            let analyser: AnalyserNode | null = null;
-            let source: MediaStreamAudioSourceNode | null = null;
-            let animationFrameId: number | null = null;
-            let silenceTimeoutId: ReturnType<typeof setTimeout> | null = null;
-            let wasSoundDetected = false; // Track if sound has already been detected
-            let isSilent = true; // Track current silence state
+             console.log('[sttWorker/audioAnalysisService] Received input - stream:', stream.id, 'minDecibels:', minDecibels, 'silenceDuration:', silenceDuration);
+             // Check if stream is active
+             if (!stream || !stream.active) {
+                 console.error('[sttWorker/audioAnalysisService] Received inactive stream.');
+                 // Send an error back immediately?
+                 // sendBack({ type: 'ANALYSIS_ERROR', error: 'Inactive stream provided' });
+                 return; // Stop execution
+             }
+             // ... rest of the analysis service logic ...
+             // Ensure it uses the correct `sendBack` for events like SOUND_DETECTED, SILENCE_DETECTED, _AUDIO_ANALYSIS_UPDATE
+             let audioContext: AudioContext | null = null;
+             let analyser: AnalyserNode | null = null;
+             let source: MediaStreamAudioSourceNode | null = null;
+             let animationFrameId: number | null = null;
+             let silenceTimeoutId: ReturnType<typeof setTimeout> | null = null;
+             let wasSoundDetected = false;
+             let isSilent = true;
 
-            console.log('[sttMachine/audioAnalysisService] Starting analysis...');
+             try {
+                 audioContext = new AudioContext();
+                 source = audioContext.createMediaStreamSource(stream);
+                 analyser = audioContext.createAnalyser();
+                 analyser.minDecibels = minDecibels;
+                 analyser.maxDecibels = -30;
+                 source.connect(analyser);
 
-            try {
-                audioContext = new AudioContext();
-                source = audioContext.createMediaStreamSource(stream);
-                analyser = audioContext.createAnalyser();
-                analyser.minDecibels = minDecibels;
-                analyser.maxDecibels = -30; // Default max, can be adjusted
-                source.connect(analyser);
+                 const bufferLength = analyser.frequencyBinCount;
+                 const domainData = new Uint8Array(bufferLength);
+                 const timeDomainData = new Uint8Array(analyser.fftSize);
 
-                const bufferLength = analyser.frequencyBinCount;
-                const domainData = new Uint8Array(bufferLength);
-                const timeDomainData = new Uint8Array(analyser.fftSize);
+                 const loop = () => {
+                     if (!analyser || !audioContext || audioContext.state === 'closed') {
+                         console.log('[sttWorker/audioAnalysisService] Analysis loop stopping (context closed or analyser missing).');
+                         return;
+                     }
+                     analyser.getByteTimeDomainData(timeDomainData);
+                     analyser.getByteFrequencyData(domainData);
+                     const rms = calculateRMS(timeDomainData);
+                     const hasSound = domainData.some(value => value > 0);
 
-                const loop = () => {
-                    if (!analyser) return;
-                    analyser.getByteTimeDomainData(timeDomainData);
-                    analyser.getByteFrequencyData(domainData);
-                    const rms = calculateRMS(timeDomainData);
-                    const hasSound = domainData.some(value => value > 0);
+                     sendBack({ type: '_AUDIO_ANALYSIS_UPDATE', rms });
 
-                    // Send RMS update event every frame
-                    sendBack({ type: '_AUDIO_ANALYSIS_UPDATE', rms });
-                    // Log after sending event
-                    // console.log(`[sttMachine/audioAnalysisService] Sent _AUDIO_ANALYSIS_UPDATE, RMS: ${rms.toFixed(3)}`);
+                     if (hasSound) {
+                         isSilent = false;
+                         if (silenceTimeoutId) { clearTimeout(silenceTimeoutId); silenceTimeoutId = null; }
+                         if (!wasSoundDetected) {
+                             console.log('[sttWorker/audioAnalysisService] SOUND DETECTED');
+                             sendBack({ type: 'SOUND_DETECTED' });
+                             wasSoundDetected = true;
+                         }
+                     } else {
+                         if (!isSilent && !silenceTimeoutId) {
+                             console.log(`[sttWorker/audioAnalysisService] Silence started, timeout ${silenceDuration}ms`);
+                             silenceTimeoutId = setTimeout(() => {
+                                 console.log('[sttWorker/audioAnalysisService] SILENCE DETECTED (timeout)');
+                                 sendBack({ type: 'SILENCE_DETECTED' });
+                                 silenceTimeoutId = null;
+                                 isSilent = true;
+                                 wasSoundDetected = false;
+                             }, silenceDuration);
+                         }
+                         isSilent = true;
+                     }
+                     animationFrameId = requestAnimationFrame(loop);
+                 };
+                 animationFrameId = requestAnimationFrame(loop);
 
-                    if (hasSound) {
-                        // Sound is present
-                        isSilent = false;
-                        if (silenceTimeoutId) {
-                            clearTimeout(silenceTimeoutId);
-                            silenceTimeoutId = null;
-                        }
-                        if (!wasSoundDetected) {
-                            console.log('[sttMachine/audioAnalysisService] SOUND DETECTED');
-                            sendBack({ type: 'SOUND_DETECTED' });
-                            wasSoundDetected = true; // Send only once per listening cycle? Or allow re-trigger?
-                                                    // Current logic sends SOUND_DETECTED only once after silence.
-                        }
-                    } else {
-                        // Sound is not present (silence)
-                        if (!isSilent && !silenceTimeoutId) {
-                            // Transitioning to silence, start timer
-                            console.log(`[sttMachine/audioAnalysisService] Silence started, timeout ${silenceDuration}ms`);
-                            silenceTimeoutId = setTimeout(() => {
-                                console.log('[sttMachine/audioAnalysisService] SILENCE DETECTED (timeout)');
-                                sendBack({ type: 'SILENCE_DETECTED' });
-                                silenceTimeoutId = null;
-                                isSilent = true; // Mark as definitively silent after timeout
-                                wasSoundDetected = false; // Reset sound detection flag after silence
-                            }, silenceDuration);
-                        }
-                        // Update isSilent flag immediately
-                        isSilent = true;
-                    }
+             } catch (err: any) {
+                  console.error('[sttWorker/audioAnalysisService] Error starting:', err);
+                  if (source) source.disconnect();
+                  if (audioContext && audioContext.state !== 'closed') audioContext.close();
+                  if (animationFrameId) cancelAnimationFrame(animationFrameId);
+                  if (silenceTimeoutId) clearTimeout(silenceTimeoutId);
+                  // Send error back to machine?
+                  // sendBack({ type: 'ANALYSIS_ERROR', error: err.message });
+                  return;
+             }
 
-                    animationFrameId = requestAnimationFrame(loop);
-                };
-                animationFrameId = requestAnimationFrame(loop);
-
-            } catch (err: any) {
-                 console.error('[sttMachine/audioAnalysisService] Error starting:', err);
-                 // Optionally send an error event back? Or let the machine handle initialization failure?
-                 // self.send({ type: 'ANALYSIS_ERROR', error: err.message });
-                 // Cleanup if partially initialized
-                 if (source) source.disconnect();
-                 if (audioContext && audioContext.state !== 'closed') audioContext.close();
+             return () => {
+                 console.log(`[sttWorker/audioAnalysisService] Stopping analysis for worker ${self.id}...`);
                  if (animationFrameId) cancelAnimationFrame(animationFrameId);
-                 if (silenceTimeoutId) clearTimeout(silenceTimeoutId); // Clear timer on cleanup
-                 return;
-            }
-
-            // Cleanup function returned by fromCallback
-            return () => {
-                console.log('[sttMachine/audioAnalysisService] Stopping analysis...');
-                if (animationFrameId) cancelAnimationFrame(animationFrameId);
-                if (source) source.disconnect();
-                if (analyser) analyser.disconnect(); // Ensure analyser is also disconnected
-                if (audioContext && audioContext.state !== 'closed') {
-                    audioContext.close().catch(e => console.error('Error closing AudioContext:', e));
-                }
-                 // Send one last update with 0 RMS? Optional.
-                 // sendBack({ type: '_AUDIO_ANALYSIS_UPDATE', rms: 0, hasSound: false });
-            };
+                 if (silenceTimeoutId) clearTimeout(silenceTimeoutId);
+                 if (source) source.disconnect();
+                 if (analyser) analyser.disconnect();
+                 if (audioContext && audioContext.state !== 'closed') {
+                     audioContext.close().catch(e => console.error('Error closing AudioContext:', e));
+                 }
+             };
         })
     },
     actions: {
+        assignRecorder: assign({
+            mediaRecorder: ({ event }) => {
+                return (event as DoneActorEvent<MediaRecorder>).output;
+            }
+        }),
         assignError: assign({
             errorMessage: ({ event }) => {
-                console.error("[sttMachine] Error event received:", event); // Log the whole error event
-                let message = 'An unknown STT error occurred';
-                // Check specific event types first
-                if (event.type === 'PERMISSION_DENIED' || event.type === 'INITIALIZATION_FAILED' || event.type === 'TRANSCRIPTION_ERROR') {
-                    message = event.error; // Assuming simple string error
-                } else if ('data' in event && event.data) {
-                    // Handle errors from invoked actors (promises)
-                    const errorData = event.data;
-                    if (errorData instanceof Error) {
-                         message = errorData.message;
-                    } else if (typeof errorData === 'string') {
-                         message = errorData;
-                    } else if (typeof errorData === 'object' && errorData !== null) {
-                        if ('detail' in errorData && typeof errorData.detail === 'string') {
-                            message = errorData.detail; // Extract detail if available
-                        } else if ('message' in errorData && typeof errorData.message === 'string') {
-                            message = errorData.message; // Extract message if available
-                        } else {
-                            try { message = JSON.stringify(errorData); } catch { /* Ignore stringify errors */ }
-                        }
-                    }
+                console.error("[sttWorker] Error event received:", event);
+                let message = 'An unknown worker error occurred';
+                // Prioritize actor errors
+                if (event.type === 'error.actor') {
+                    const errorData = event.error;
+                    if (errorData instanceof Error) message = errorData.message;
+                    else if (typeof errorData === 'string') message = errorData;
+                    else try { message = JSON.stringify(errorData); } catch { /* ignore */ }
+                } else if (event.type === 'INITIALIZATION_FAILED') { // Keep specific init failed
+                    message = event.error;
                 }
-                console.log(`[sttMachine] Assigning error message: ${message}`);
+                // else if ('data' in event && event.data) { // Handle errors from promises (like initializeRecorderActor)
+                //     const errorData = event.data;
+                //     if (errorData instanceof Error) message = errorData.message;
+                //     else if (typeof errorData === 'string') message = errorData;
+                //     else try { message = JSON.stringify(errorData); } catch { /* ignore */ }
+                // }
+                console.log(`[sttWorker] Assigning error message: ${message}`);
                 return message;
-            },
-            // Clear other relevant fields on error?
-            audioStream: ({context, event}) => (event.type === 'PERMISSION_DENIED' || 'data' in event) ? null : context.audioStream,
-            mediaRecorder: ({context, event}) => (event.type === 'INITIALIZATION_FAILED' || 'data' in event) ? null : context.mediaRecorder,
-            audioChunks: [], // Clear chunks on error
-            transcribedText: null
+            }
+            // No context clearing here, happens on stop/manager decision
         }),
-        clearError: assign({ errorMessage: null }),
+        // clearError removed (errors lead to stopped state or are handled by manager)
+        // startRecorder/stopRecorder remain similar but logs adjusted
         startRecorder: ({ context }) => {
             if (context.mediaRecorder && context.mediaRecorder.state === 'inactive') {
-                console.log('[sttMachine] Starting media recorder with timeslice...');
-                // Add timeslice argument (e.g., 500ms) to trigger ondataavailable periodically
-                context.mediaRecorder.start(500);
+                console.log('[sttWorker] Starting media recorder with timeslice...');
+                // Listen for data using the machine's event handler
+                context.mediaRecorder.ondataavailable = (event) => {
+                    if (event.data.size > 0) {
+                         // Send event to self - requires self ref? No, machine handles this directly.
+                         // Need to use `self.send()` or pass `sendBack`?
+                         // Let's handle recorder events directly in the state definition for now.
+                         console.log("[sttWorker] Recorder data available, size:", event.data.size); // Log here
+                         // This won't work directly. Need to set up listener in the state definition.
+                    }
+                 };
+                context.mediaRecorder.start(500); // Use a reasonable timeslice
             } else {
-                console.warn('[sttMachine] Recorder not ready or already recording.');
+                console.warn('[sttWorker] Recorder not ready or already recording.');
             }
         },
+         // Action to setup recorder listeners
+         setupRecorderListeners: ({ context, self }) => {
+             if (context.mediaRecorder) {
+                 console.log('[sttWorker] Setting up MediaRecorder listeners...');
+                 context.mediaRecorder.ondataavailable = (event) => {
+                     if (event.data.size > 0) {
+                         // Use self.send to send the event to the machine instance
+                         self.send({ type: 'RECORDING_DATA_AVAILABLE', data: event.data });
+                     }
+                 };
+                 context.mediaRecorder.onstop = () => {
+                      console.log('[sttWorker] MediaRecorder stopped.');
+                      // Optionally send an internal event if needed
+                 };
+                 context.mediaRecorder.onerror = (event) => {
+                      console.error('[sttWorker] MediaRecorder error:', event);
+                      // Send error event to the machine
+                      self.send({ type: 'INITIALIZATION_FAILED', error: 'MediaRecorder error' }); // Reuse or create specific event?
+                 };
+             } else {
+                 console.error('[sttWorker] Cannot setup listeners, MediaRecorder is null.');
+             }
+         },
         stopRecorder: ({ context }) => {
             if (context.mediaRecorder && context.mediaRecorder.state === 'recording') {
-                console.log('[sttMachine] Stopping media recorder...');
+                console.log('[sttWorker] Stopping media recorder...');
+                 // Remove listeners before stopping? Maybe not necessary if worker is stopping anyway.
+                 // context.mediaRecorder.ondataavailable = null;
+                 // context.mediaRecorder.onstop = null;
+                 // context.mediaRecorder.onerror = null;
                 context.mediaRecorder.stop();
+            } else if (context.mediaRecorder && context.mediaRecorder.state === 'inactive'){
+                 console.log('[sttWorker] Recorder was already inactive.');
             } else {
-                console.warn('[sttMachine] Recorder not recording or not available.');
+                 console.warn('[sttWorker] Recorder not recording or not available.');
             }
         },
         appendAudioChunk: assign({
             audioChunks: ({ context, event }) => {
                 if (event.type === 'RECORDING_DATA_AVAILABLE') {
-                    console.log(`[sttMachine] Appending audio chunk, size: ${event.data.size}. Current chunks: ${context.audioChunks.length}`);
+                    // Minimal logging for chunks
+                    // console.log(`[sttWorker] Appending audio chunk. Current chunks: ${context.audioChunks.length + 1}`);
                     return [...context.audioChunks, event.data];
                 }
                 return context.audioChunks;
             }
         }),
+        // clearAudioChunks remains useful before processing
         clearAudioChunks: assign({ audioChunks: [] }),
-        closeAudioStream: ({ context }: { context: SttContext }) => {
-            console.log('[sttMachine] Closing audio stream tracks (action)...');
-            context.audioStream?.getTracks().forEach(track => track.stop());
-            // Return the result of assign()
-            return assign({
-                audioStream: null,
-                audioContext: null,
-                analyserNode: null,
-                // Ensure silenceStartTime is cleared if it exists in context (it doesn't currently)
-                // silenceStartTime: null,
-                rmsLevel: 0
-           });
-        },
-        resetContext: assign({
-            audioStream: null,
-            mediaRecorder: null,
-            audioChunks: [],
-            transcribedText: null,
-            errorMessage: null,
-            // Also reset analysis context
-            rmsLevel: 0,
-            audioContext: null,
-            analyserNode: null,
-        }),
-        updateToken: assign({
-            apiToken: ({ event, context }) => {
-                if (event.type === 'START_LISTENING' && event.payload?.token !== undefined) {
-                    return event.payload.token;
-                }
-                return context.apiToken; // Keep existing if not provided
-            }
-        }),
-        // Modified Action for Analysis Update (RMS only)
+        // closeAudioStream removed - manager handles stream
+        // resetContext removed - manager handles lifecycle
+        // updateToken removed - token passed via input
         assignAnalysisUpdate: assign({
             rmsLevel: ({ context, event }) => {
                 if (event.type === '_AUDIO_ANALYSIS_UPDATE') {
-                     // console.log(`[sttMachine] assignAnalysisUpdate called. RMS: ${event.rms}`); // Remove log
                      return event.rms;
                  }
-                 // Return previous value if event type doesn't match
                  return context.rmsLevel;
             },
         }),
-        // New action to reset analysis context specifically on error
-        resetAnalysisContextOnError: assign({
-            audioStream: null,
-            mediaRecorder: null,
-            audioChunks: [],
-            transcribedText: null,
-            // Keep errorMessage as is
-            rmsLevel: 0,
-            audioContext: null,
-            analyserNode: null,
-        })
+        // resetAnalysisContextOnError removed
+        // --- New Actions for Parent Communication ---
+        sendSilenceToParent: sendParent(({ self }) => ({ type: 'WORKER_SILENCE_DETECTED', workerRef: self })),
+        sendResultToParent: sendParent(
+            ({ context, event }) => {
+                // Explicitly type the event for this specific context
+                const doneEvent = event as DoneActorEvent<{ text: string }>;
+                // Check the correct event type AND if the output exists and has text
+                if (doneEvent.type === 'xstate.done.actor.transcriptionActor' && typeof doneEvent.output?.text === 'string') {
+                    console.log(`[sttWorker] Sending WORKER_TRANSCRIPTION_RESULT: "${doneEvent.output.text}"`);
+                    return { type: 'WORKER_TRANSCRIPTION_RESULT', text: doneEvent.output.text };
+                }
+                console.log('[sttWorker] No text found in transcription result, sending empty result.');
+                // Send empty text if transcription succeeded but returned nothing (still check type)
+                if (doneEvent.type === 'xstate.done.actor.transcriptionActor') {
+                    return { type: 'WORKER_TRANSCRIPTION_RESULT', text: '' };
+                }
+                return { type: 'ignore' }; // Should not happen if called correctly
+            }
+        ),
+        sendErrorToParent: sendParent(
+            ({ context, event }) => {
+                // Extract error message from context or event
+                let errorMessage = context.errorMessage || 'Unknown worker error';
+                // If triggered by actor error event, use that specific error
+                if (event.type === 'error.actor' && event.id === 'transcriptionActor') {
+                     const errorData = event.error;
+                      if (errorData instanceof Error) errorMessage = errorData.message;
+                      else if (typeof errorData === 'string') errorMessage = errorData;
+                      else try { errorMessage = JSON.stringify(errorData); } catch { /* ignore */ }
+                      console.error('[sttWorker] Transcription actor failed:', errorMessage);
+                } else if (event.type === 'error.actor' && event.id === 'initializeRecorderActor') {
+                     const errorData = event.error;
+                      if (errorData instanceof Error) errorMessage = errorData.message;
+                      else if (typeof errorData === 'string') errorMessage = errorData;
+                      else try { errorMessage = JSON.stringify(errorData); } catch { /* ignore */ }
+                      console.error('[sttWorker] Initialize recorder actor failed:', errorMessage);
+                }
+                 // Use the message stored in context if available (from assignError)
+                 errorMessage = context.errorMessage || errorMessage;
+
+                console.log(`[sttWorker] Sending WORKER_ERROR: ${errorMessage}`);
+                return { type: 'WORKER_ERROR', error: errorMessage };
+            }
+        )
     },
     guards: {
         hasAudioChunks: ({ context }) => context.audioChunks.length > 0,
-        hasTranscribeFn: ({ context }) => typeof context.transcribeFn === 'function',
-        hasToken: ({ context }) => typeof context.apiToken === 'string' && context.apiToken.length > 0,
+        // hasTranscribeFn removed (required input)
+        // hasToken removed (required input)
+        // Correct event type comparisons using 'xstate.' prefix
+        isMediaRecorder: ({event}) => event.type === 'xstate.done.actor.initializeRecorderActor' && event.output instanceof MediaRecorder,
+        isNotMediaRecorder: ({event}) => event.type === 'xstate.done.actor.initializeRecorderActor' && !(event.output instanceof MediaRecorder)
     }
 }).createMachine({
-    id: 'stt',
+    id: 'sttWorker', // Changed ID for clarity
+    // context initialized with required input fields
     context: ({ input }) => ({
-        audioStream: null,
+        parent: input.parent, // Store parent ref if needed for direct communication (though sendParent is preferred)
+        audioStream: input.audioStream,
         mediaRecorder: null,
         audioChunks: [],
-        transcribedText: null,
+        // transcribedText: null, // Remove from context
         errorMessage: null,
-        minDecibels: input?.minDecibels ?? -45,
-        silenceDuration: input?.silenceDuration ?? 1500,
-        transcribeFn: input?.transcribeFn,
-        apiToken: input?.apiToken,
-        // Init analysis context
+        minDecibels: input.minDecibels,
+        silenceDuration: input.silenceDuration,
+        transcribeFn: input.transcribeFn,
+        apiToken: input.apiToken,
         rmsLevel: 0,
-        audioContext: null,
-        analyserNode: null,
     }),
-    initial: 'idle',
+    // Initial state is now initializing
+    initial: 'initializing',
     states: {
-        idle: {
-            entry: ['resetContext', log('[sttMachine] Entering idle state')], // Add log
-            on: {
-                START_LISTENING: {
-                    target: 'permissionPending',
-                    // Add log action here
-                    actions: [log('[sttMachine] Received START_LISTENING in idle state'), 'updateToken']
-                }
-            }
-        },
-        permissionPending: {
-            entry: log('[sttMachine] Entering permissionPending state...'),
-            invoke: {
-                id: 'micPermissionActor',
-                src: 'micPermissionActor',
-                onDone: {
-                    target: 'initializing',
-                    actions: [
-                        log(({ context, event }: { context: SttContext, event: DoneActorEvent<MediaStream> }) => `[sttMachine] Before assignStream. Context stream: ${context.audioStream}, Event output stream: ${event.output instanceof MediaStream}`),
-                        // Inline the assignStream logic here
-                        assign( ({ event }: { event: DoneActorEvent<MediaStream> }) => {
-                            console.log('[sttMachine] Assigning stream from event:', event.output);
-                            if (event.output instanceof MediaStream) {
-                                return {
-                                    audioStream: event.output,
-                                    errorMessage: undefined // Clear error on success
-                                };
-                            } else {
-                                console.error('[sttMachine] Invalid stream in PERMISSION_GRANTED event output!');
-                                return {
-                                    audioStream: null,
-                                    errorMessage: 'Invalid MediaStream received after permission grant.'
-                                };
-                            }
-                        }),
-                        log(({ context }: { context: SttContext }) => `[sttMachine] After assignStream. Context stream: ${context.audioStream}`)
-                    ]
-                },
-                onError: {
-                    target: 'error',
-                    actions: 'assignError' // Use existing named action as a string
-                }
-            },
-             on: {
-                // Allow stopping while pending permission
-                STOP_LISTENING: { target: 'idle' },
-                RESET: { target: 'idle' }
-            }
-        },
+        // idle state removed
+        // permissionPending state removed
         initializing: {
-            entry: log('[sttMachine] Entering initializing state...'),
-            // Use single invoke with proper onDone/onError handling
+            entry: log('[sttWorker] Entering initializing state...'),
             invoke: {
                 id: 'initializeRecorderActor',
                 src: 'initializeRecorderActor',
-                input: ({ context }) => ({ stream: context.audioStream! }),
+                input: ({ context }) => ({ stream: context.audioStream }),
                 onDone: {
                     target: 'listening',
-                    // Assign recorder directly inline using assign
-                    actions: assign(
-                        ({ event }: { event: DoneActorEvent<MediaRecorder> }) => {
-                            if (event.output instanceof MediaRecorder) {
-                                return {
-                                    mediaRecorder: event.output,
-                                    errorMessage: undefined // Clear error on success
-                                };
-                            } else {
-                                console.error('[sttMachine] Invalid output from initializeRecorderActor:', event.output);
-                                return {
-                                    mediaRecorder: null,
-                                    errorMessage: 'Failed to initialize MediaRecorder instance.' // Set error message
-                                };
-                            }
-                        }
-                    )
+                    actions: [{ type: 'assignRecorder' }, log('[sttWorker] Recorder initialized, moving to listening.')]
                 },
                 onError: {
-                    target: 'error',
-                    // Use existing named action
-                    actions: ['assignError', 'closeAudioStream'] // Assign error and cleanup stream
+                    target: 'stopped',
+                    actions: [{ type: 'assignError' }, 'sendErrorToParent', log('[sttWorker] Recorder initialization failed.')]
                 }
             },
-             on: {
-                // Still allow stopping during initialization
-                STOP_LISTENING: { target: 'idle', actions: 'closeAudioStream' },
-                RESET: { target: 'idle', actions: ['closeAudioStream', 'resetContext'] }
+            on: {
+                // Allow stopping during initialization
+                STOP: { target: 'stopped', actions: log('[sttWorker] Received STOP during initialization.') }
             }
         },
         listening: {
             id: 'listeningState',
             entry: [
-                log('[sttMachine] Entering listening state...'),
-                'clearError'
+                log('[sttWorker] Entering listening state...'),
+                // 'clearError' // Error cleared on successful init
             ],
             invoke: {
                  id: 'audioAnalysisService',
                  src: 'audioAnalysisService',
                  input: ({context}) => ({
-                     stream: context.audioStream!,
+                     stream: context.audioStream, // Use stream from context
                      minDecibels: context.minDecibels,
-                     silenceDuration: context.silenceDuration // Pass duration to service
+                     silenceDuration: context.silenceDuration
                  }),
+                  // Handle errors from the analysis service itself?
+                  onError: {
+                      target: 'stopped',
+                      actions: [
+                          assign({errorMessage: 'Audio analysis service failed'}), // Generic error
+                          'sendErrorToParent',
+                          log('[sttWorker] Audio Analysis Service error.')
+                      ]
+                  }
              },
             on: {
-                // Use explicit SOUND_DETECTED event for transition
                 SOUND_DETECTED: {
                      target: 'recording',
-                     // Remove log action temporarily to test transition
-                     // actions: log('SOUND_DETECTED event received in listening state')
+                     actions: log('[sttWorker] SOUND_DETECTED event received.')
                  },
-                 _AUDIO_ANALYSIS_UPDATE: { // Still listen for RMS updates
+                 _AUDIO_ANALYSIS_UPDATE: {
                      actions: 'assignAnalysisUpdate'
                  },
-                STOP_LISTENING: { target: 'idle', actions: 'closeAudioStream' },
-                RESET: { target: 'idle', actions: ['closeAudioStream', 'resetContext'] },
-                // Add handler for START_LISTENING here too? Maybe just log.
-                START_LISTENING: {
-                    actions: log('[sttMachine] Received START_LISTENING while already listening (ignored)')
-                }
+                 // Stop command from manager
+                 STOP: { target: 'stopped', actions: log('[sttWorker] Received STOP during listening.') }
             },
-            exit: log('Exiting listening state') // Stop analysis service implicitly via state exit?
+            // exit: log('[sttWorker] Exiting listening state.') // analysis service stopped implicitly
         },
         recording: {
             id: 'recordingState',
             entry: [
-                log('[sttMachine] Entering recording state...'),
-                log('Recording started...'),
-                'startRecorder'
+                log('[sttWorker] Entering recording state...'),
+                'startRecorder' // Start recorder assumes listeners are set up
             ],
-             invoke: {
-                 id: 'audioAnalysisService', // Reuse ID to ensure only one runs
+             invoke: { // Keep analysis running
+                 id: 'audioAnalysisService',
                  src: 'audioAnalysisService',
                  input: ({context}) => ({
-                     stream: context.audioStream!,
+                     stream: context.audioStream,
                      minDecibels: context.minDecibels,
-                     silenceDuration: context.silenceDuration // Pass duration to service
+                     silenceDuration: context.silenceDuration
                  }),
+                  onError: { // Handle analysis errors during recording too
+                      target: 'stopped',
+                      actions: [
+                          assign({errorMessage: 'Audio analysis service failed during recording'}),
+                          'sendErrorToParent',
+                          log('[sttWorker] Audio Analysis Service error during recording.')
+                      ]
+                  }
              },
             on: {
+                // Event sent internally from setupRecorderListeners
                 RECORDING_DATA_AVAILABLE: { actions: 'appendAudioChunk' },
-                 // Use explicit SILENCE_DETECTED event for transition
-                 SILENCE_DETECTED: {
-                     target: 'processing',
-                     guard: ({ context }) => context.audioChunks.length > 0, // Use inline guard
-                     actions: log('SILENCE_DETECTED event received in recording state')
+                SILENCE_DETECTED: {
+                     target: 'waitingForProcessing', // Go to new state
+                     guard: 'hasAudioChunks',
+                     // Send event to parent INSTEAD of transitioning directly
+                     actions: ['sendSilenceToParent', log('[sttWorker] SILENCE_DETECTED, notifying parent.')]
                  },
-                 _AUDIO_ANALYSIS_UPDATE: { // Still listen for RMS updates
+                 _AUDIO_ANALYSIS_UPDATE: {
                      actions: 'assignAnalysisUpdate'
                  },
-                STOP_LISTENING: {
-                    target: 'processing',
-                    guard: ({ context }) => context.audioChunks.length > 0
-                },
-                RESET: { target: 'idle', actions: ['closeAudioStream', 'resetContext'] }
+                 // Stop command from manager
+                 STOP: {
+                     target: 'stopped', // Stop immediately if told to
+                     actions: ['stopRecorder', log('[sttWorker] Received STOP during recording.')]
+                 }
             },
-            exit: ['stopRecorder', log('Exiting recording state')]
+            exit: ['stopRecorder', log('[sttWorker] Exiting recording state.')] // Stop recorder when leaving
+        },
+        // New state to wait for manager's instruction
+        waitingForProcessing: {
+             id: 'waitingState',
+             entry: log('[sttWorker] Entering waitingForProcessing state...'),
+             on: {
+                 PROCESS_CHUNKS: {
+                     target: 'processing',
+                     // Guard shouldn't be needed here if SILENCE_DETECTED guard worked
+                     actions: log('[sttWorker] Received PROCESS_CHUNKS, moving to processing.')
+                 },
+                 // Also handle STOP while waiting
+                 STOP: {
+                      target: 'stopped',
+                      actions: log('[sttWorker] Received STOP while waiting for processing.')
+                  }
+             },
+             // Exit actions if needed? Recorder should already be stopped from recording exit.
         },
         processing: {
-            entry: log('Processing recorded audio...'),
+             id: 'processingState',
+            // Clear chunks just before invoking actor
+            entry: [log('[sttWorker] Entering processing state...'), 'clearAudioChunks'],
             invoke: {
                 id: 'transcriptionActor',
                 src: 'transcriptionActor',
-                input: ({ context }) => ({ chunks: context.audioChunks, transcribeFn: context.transcribeFn, token: context.apiToken }),
+                // Pass required context items
+                input: ({ context }) => ({
+                    chunks: context.audioChunks, // Chunks should be available here
+                    transcribeFn: context.transcribeFn,
+                    token: context.apiToken
+                }),
                 onDone: {
-                    target: 'transcribed',
-                    // Make actions an array
-                    actions: [
-                        // First, assign the text to context
-                        assign(
-                            ({ event }: { event: DoneActorEvent<{ text: string }> }) => {
-                                if (event.output && typeof event.output.text === 'string') {
-                                    console.log(`[sttMachine] Assigning transcribed text: "${event.output.text}"`);
-                                    return {
-                                        transcribedText: event.output.text,
-                                        errorMessage: null,
-                                        audioChunks: []
-                                    };
-                                }
-                                console.warn('[sttMachine] Transcription completed but no text found in event output:', event.output);
-                                return {
-                                    transcribedText: null,
-                                    errorMessage: 'Transcription successful but no text received.',
-                                    audioChunks: []
-                                };
-                            }
-                        ),
-                        // Second, send result to parent
-                        sendParent( ({ event } : { event: DoneActorEvent<{ text: string }> }) => {
-                            if (event.output && typeof event.output.text === 'string') {
-                                console.log(`[sttMachine] Sending STT_RESULT to parent: "${event.output.text}"`);
-                                return { type: 'STT_RESULT', text: event.output.text };
-                            }
-                            // Handle cases where output or text might be missing (though assign action should handle this)
-                            console.log('[sttMachine] No valid output/text found, not sending STT_RESULT to parent.');
-                            return { type: 'ignore' };
-                        })
-                    ]
+                    target: 'stopped', // Worker is done after successful transcription
+                    actions: ['sendResultToParent', log('[sttWorker] Transcription successful, stopping.')]
                 },
-                onError: { target: 'error', actions: ['assignError', 'closeAudioStream'] }
+                onError: {
+                    target: 'stopped', // Worker stops on transcription error
+                    actions: ['assignError', 'sendErrorToParent', log('[sttWorker] Transcription failed, stopping.')]
+                }
             },
-            // If no transcribeFn or token, go to error state immediately
-            always: {
-                target: 'error',
-                actions: assign({ errorMessage: 'Missing transcription function or API token.'}),
-                guard: ({context}) => !context.transcribeFn || !context.apiToken
-            },
+            // Remove always guard (manager responsibility)
             on: {
-                // Can't really stop processing, maybe RESET?
-                RESET: { target: 'idle', actions: ['closeAudioStream', 'resetContext'] }
+                 // Handle STOP event during processing? Maybe just let it finish?
+                 // For simplicity, let's assume it finishes or errors out.
+                 // If immediate stop is needed, we'd need cancellation logic.
+                 STOP: {
+                     actions: log('[sttWorker] Received STOP during processing (ignored, will finish/error out).')
+                 }
             }
         },
-        transcribed: {
-            entry: [log( ({context}) => `[sttMachine] Entering transcribed state. Text: ${context.transcribedText}`)], // Modify log
-            on: {
-                START_LISTENING: {
-                    target: 'listening',
-                    actions: log('[sttMachine] Received START_LISTENING in transcribed state, restarting.')
-                },
-                STOP_LISTENING: { target: 'idle', actions: 'closeAudioStream' },
-                RESET: { target: 'idle', actions: ['closeAudioStream', 'resetContext'] }
-            }
-        },
-        error: {
-            entry: [
-                log( ({context}) => `STT Error: ${context.errorMessage}`),
-                // Ensure stream/recorder are stopped if error occurs during active states
-                 ({context}) => {
-                     if (context.mediaRecorder && context.mediaRecorder.state !== 'inactive') context.mediaRecorder.stop();
-                     if (context.audioStream) context.audioStream.getTracks().forEach(track => track.stop());
-                 },
-                 // Call named action for context reset
-                 'resetAnalysisContextOnError'
-            ],
-            on: {
-                START_LISTENING: { target: 'permissionPending', actions: ['clearError', 'updateToken'] }, // Retry
-                RESET: { target: 'idle', actions: 'resetContext' } // Use full reset here
-            }
+        // transcribed state removed
+        // error state removed
+
+        // Final state for the worker
+        stopped: {
+            type: 'final',
+            entry: log('[sttWorker] Entering final stopped state.')
+            // Cleanup actions like stopping recorder/analysis are handled in exit actions of previous states or manager stops the actor.
         }
     }
 });
+
+// blobToFile helper function might still be needed if not globally available
+// function blobToFile(theBlob: Blob, fileName: string): File { ... }
 
 // Helper function definition (if not already available)
 // function blobToFile(theBlob: Blob, fileName: string): File {

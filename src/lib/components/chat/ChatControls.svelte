@@ -24,8 +24,8 @@
 	export let params = {};
 
 	export let eventTarget: EventTarget;
-	export let submitPrompt: Function;
-	export let stopResponse: Function;
+	export let submitPrompt: (text: string, options?: { files?: any[]; _raw?: boolean }) => Promise<any>;
+	export let stopResponse: () => void;
 	export let showMessage: Function;
 	export let files;
 	export let modelId;
@@ -154,7 +154,6 @@
 							class=" h-full max-h-[100dvh] bg-white text-gray-700 dark:bg-black dark:text-gray-300 flex justify-center"
 						>
 							<CallOverlay
-								bind:files
 								{submitPrompt}
 								{stopResponse}
 								{modelId}
@@ -235,7 +234,6 @@
 						{#if $showCallOverlay}
 							<div class="w-full h-full flex justify-center">
 								<CallOverlay
-									bind:files
 									{submitPrompt}
 									{stopResponse}
 									{modelId}

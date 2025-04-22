@@ -62,7 +62,9 @@ export const toolServers = writable([]);
 
 export const banners: Writable<Banner[]> = writable([]);
 
-export const settings: Writable<Settings> = writable({});
+export const settings: Writable<Settings> = writable({
+	chatDirection: 'auto',
+});
 
 export const showSidebar = writable(false);
 export const showSettings = writable(false);
