@@ -14,12 +14,15 @@
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import VideoInputMenu from './CallOverlay/VideoInputMenu.svelte';
 	import { KokoroWorker } from '$lib/workers/KokoroWorker';
-    // Import the new TTS machine
-    import { ttsMachine, type TTSContext } from '$lib/machines/ttsMachine';
-    // Import the new Call machine
-    import { callMachine } from '$lib/machines/callMachine';
-    // Import the new STT machine
-    import { sttMachine, type SttContext } from '$lib/machines/sttMachine';
+	// Import the new TTS machine
+	import { ttsMachine, type TTSContext } from '$lib/machines/ttsMachine';
+	// Import the new Call machine
+	import { callMachine } from '$lib/machines/callMachine';
+	// Import the new STT Manager machine
+	import { sttManagerMachine, type SttManagerContext } from '$lib/machines/sttManagerMachine'; // Import Manager
+	// Import the new Chat machine
+	import { chatMachine } from '$lib/machines/chatMachine'; // Import Chat Machine
+	import type { SttContext } from '$lib/machines/sttMachine'; // Import SttContext for type check
 	import type { ActorRefFrom } from 'xstate';
 
 	// --- Type Helper ---
@@ -33,7 +36,7 @@
 	const i18n = getContext<any>('i18n');
 
 	export let eventTarget: EventTarget;
-	export let submitPrompt: Function;
+	export let submitPrompt: (prompt: string, options?: any) => Promise<any>;
 	export let stopResponse: Function; // Keep this prop to stop backend generation
 	export let files;
 	export let chatId;
@@ -42,63 +45,69 @@
 	let wakeLock: any = null;
 	let model: any = null;
 
-	let loading = false; // Keep for transcription loading (might be combined later)
-	// let interrupted = false; // Replaced by TTS machine state/events
-	// let assistantSpeaking = false; // Replaced by TTS machine state/events
-
-	// let emoji = null; // Replaced by TTS machine context
 	let camera = false;
 	let cameraStream: MediaStream | null = null;
 
-	let chatStreaming = false; // Keep track of backend streaming
+	let chatStreaming = false; // Keep track of backend streaming (maybe move to chatMachine later?)
 
 	let videoElement: HTMLVideoElement | null = null;
 	let canvasElement: HTMLCanvasElement | null = null;
-	let audioElement: HTMLAudioElement | null = null; // Used by TTS machine via context/logic if needed
+	let audioElement: HTMLAudioElement | null = null;
 
 	// --- State Machines ---
 
-    // TTS Machine - Pass necessary functions/config as input
-    const { snapshot: ttsSnapshot, send: sendTts } = useMachine(ttsMachine, {
-        input: {
-            // Pass static config and potentially reactive refs/stores
-            ttsSettings: $settings?.audio, // Pass the whole audio settings object
-            configSettings: undefined, // $config doesn't have audio settings
-            apiConfig: {
-                token: localStorage.token, // Get token at instantiation time
-                modelId: modelId,
-                chatId: chatId,
-            },
-            // Pass functions directly
-            generateEmoji: generateEmoji,
-            synthesizeSpeech: synthesizeOpenAISpeech,
-            ttsWorker: $TTSWorker, // Pass the worker instance
-        }
-    });
+	// TTS Machine
+	const { snapshot: ttsSnapshot, send: sendTts } = useMachine(ttsMachine, {
+		input: {
+			ttsSettings: $settings?.audio,
+			configSettings: undefined, // Placeholder if $config needed direct tts settings later
+			apiConfig: {
+				token: localStorage.token,
+				modelId: modelId,
+				chatId: chatId
+			},
+			generateEmoji: generateEmoji,
+			synthesizeSpeech: synthesizeOpenAISpeech,
+			ttsWorker: $TTSWorker
+		}
+	});
 
-    // Call Machine
-    const { snapshot: callSnapshot, send: sendCall } = useMachine(callMachine);
+	// Call Machine
+	const { snapshot: callSnapshot, send: sendCall } = useMachine(callMachine);
 
-    // STT Machine
-    const { snapshot: sttSnapshot, send: sendStt } = useMachine(sttMachine, {
-        input: {
-            // Pass transcription function and token
-            transcribeFn: transcribeAudio,
-            apiToken: localStorage.token, // Get token at instantiation
-            // Optionally pass custom sensitivity/silence duration
-            // minDecibels: -50, // Example
-            // silenceDuration: 2000 // Example
-        }
-    });
+	// STT Manager Machine
+	const { snapshot: sttManagerSnapshot, send: sendSttManager } = useMachine(sttManagerMachine, {
+		input: {
+			sttEngineSetting: (($config as any)?.audio?.stt?.engine || 'whisper'),
+			apiToken: localStorage.token,
+			transcribeFn: transcribeAudio
+		}
+	});
+
+	// Chat Machine - Inject the submitPrompt function
+	const { snapshot: chatSnapshot, send: sendChat } = useMachine(chatMachine, {
+		input: {
+			backendSubmitFn: submitPrompt
+		}
+	});
 
 	// Reactive aliases for easier template access
-    $: ttsStateValue = $ttsSnapshot.value;
-    $: ttsContext = $ttsSnapshot.context;
-    $: currentEmoji = $ttsSnapshot.context.currentEmoji; // For template display
-    $: assistantSpeaking = $ttsSnapshot.matches('speaking'); // Derive from TTS machine state
-    $: callStateValue = $callSnapshot.value; // Alias for call machine state
-    $: sttStateValue = $sttSnapshot.value; // Alias for STT machine state
-    $: sttContextState = $sttSnapshot.context; // Alias for STT context
+	$: ttsStateValue = $ttsSnapshot.value;
+	$: ttsContext = $ttsSnapshot.context;
+	$: currentEmoji = $ttsSnapshot.context.currentEmoji;
+	$: assistantSpeaking = $ttsSnapshot.matches('speaking');
+	$: callStateValue = $callSnapshot.value;
+	$: sttManagerStateValue = $sttManagerSnapshot.value;
+	$: sttManagerContext = $sttManagerSnapshot.context;
+	// Add chat machine aliases
+	$: chatStateValue = $chatSnapshot.value;
+	$: chatContext = $chatSnapshot.context;
+	$: isChatLoading = $chatSnapshot.matches('submitting') || $chatSnapshot.context.isLoading;
+
+	// Add reactive log for UI conditions
+	$: {
+		// console.log(`[CallOverlay UI Check] Chat State: ${$chatSnapshot.value}, isLoading: ${$chatSnapshot.context.isLoading}, isChatLoading Var: ${isChatLoading}, callActive: ${$callSnapshot.matches('active')}, isListeningOrRecording: ${sttManagerContext.isListening || sttManagerContext.isRecording}`);
+	}
 
 	// --- Camera Variables ---
 	let videoInputDevices: MediaDeviceInfo[] = [];
@@ -107,7 +116,6 @@
 	// --- Functions ---
 
 	const getVideoInputDevices = async () => {
-		// ... (getVideoInputDevices logic remains the same)
 		const devices = await navigator.mediaDevices.enumerateDevices();
 		videoInputDevices = devices.filter((device) => device.kind === 'videoinput');
 
@@ -119,7 +127,9 @@
 					label: 'Screen Share',
 					kind: 'videoinput',
 					groupId: 'screen',
-					toJSON: function() { return this; }
+					toJSON: function () {
+						return this;
+					}
 				} as MediaDeviceInfo
 			];
 		}
@@ -131,9 +141,7 @@
 	};
 
 	const startCamera = async () => {
-		// ... (startCamera logic remains the same)
 		await getVideoInputDevices();
-
 		if (cameraStream === null) {
 			camera = true;
 			await tick();
@@ -148,8 +156,7 @@
 	};
 
 	const startVideoStream = async () => {
-		// ... (startVideoStream logic remains the same)
-        const video = videoElement;
+		const video = videoElement;
 		if (video) {
 			if (selectedVideoInputDeviceId === 'screen') {
 				if (!navigator.mediaDevices.getDisplayMedia) {
@@ -158,8 +165,7 @@
 					return;
 				}
 				cameraStream = await navigator.mediaDevices.getDisplayMedia({
-					video: {
-					},
+					video: {},
 					audio: false
 				});
 			} else {
@@ -179,10 +185,8 @@
 	};
 
 	const stopVideoStream = async () => {
-		// ... (stopVideoStream logic remains the same)
 		if (cameraStream) {
-			const tracks = cameraStream.getTracks();
-			tracks.forEach((track) => track.stop());
+			cameraStream.getTracks().forEach((track) => track.stop());
 		}
 		if (videoElement) {
 			videoElement.srcObject = null;
@@ -191,170 +195,222 @@
 	};
 
 	const takeScreenshot = (): string | null => {
-		// ... (takeScreenshot logic remains the same)
-        const video = videoElement;
+		const video = videoElement;
 		const canvas = canvasElement;
-
 		if (!canvas || !video || video.readyState < video.HAVE_METADATA) {
-			console.error("Canvas or Video element not found or video not ready for screenshot.");
+			console.error('Canvas or Video element not found or video not ready for screenshot.');
 			return null;
 		}
-
 		const context = canvas.getContext('2d');
 		if (!context) {
-			console.error("Failed to get 2D context from canvas.");
+			console.error('Failed to get 2D context from canvas.');
 			return null;
 		}
-
 		canvas.width = video.videoWidth;
 		canvas.height = video.videoHeight;
-
 		context.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
-
 		try {
 		const dataURL = canvas.toDataURL('image/png');
-			console.log("Screenshot Data URL length:", dataURL.length);
+			console.log('Screenshot Data URL length:', dataURL.length);
 		return dataURL;
 		} catch (e) {
-			console.error("Error generating screenshot data URL:", e);
+			console.error('Error generating screenshot data URL:', e);
 			return null;
 		}
 	};
 
 	const stopCamera = async () => {
-		// ... (stopCamera logic remains the same)
 		await stopVideoStream();
 		camera = false;
 	};
 
-    // --- Event Handlers ---
+	// --- Event Handlers ---
 
 	const chatStartHandler = async (e: Event) => {
 		const { id } = (e as CustomEvent).detail;
-		console.log(`Received chat start event for message ID ${id}`);
-		chatStreaming = true;
-        // Reset TTS machine for the new message stream
-        sendTts({ type: 'RESET' });
-        // currentMessageId is now managed within TTS machine if needed, or implicitly by queue
+		console.log(`[CallOverlay] Received chat:start event for message ID ${id}`);
+		chatStreaming = true; // Keep for now, maybe chatMachine should handle this?
+		// Reset TTS machine for the new message stream
+		sendTts({ type: 'RESET' });
+		// Optionally reset chatMachine state here if needed? Depends on desired behavior.
+		// sendChat({ type: 'RESET' }); // Or a specific event like 'STREAM_STARTED'?
 	};
 
 	const chatEventHandler = async (e: Event) => {
 		const { id, content } = (e as CustomEvent).detail;
-        // Queue the content chunk to the TTS machine
-        if (content) {
-             console.log(`Queueing TTS content for message ID ${id}: "${content.substring(0,30)}..."`);
-             sendTts({ type: 'QUEUE_MESSAGE', item: { id, content } });
-        }
+		// Queue the content chunk to the TTS machine
+		if (content) {
+			// console.log(`Queueing TTS content for message ID ${id}: "${content.substring(0, 30)}..."`); // Moved below
+			sendTts({ type: 'QUEUE_MESSAGE', item: { id, content } });
+		}
+		// Send chunk to chatMachine
+		console.log(`[CallOverlay] Received chat chunk for ID ${id}. Sending RECEIVE_CHUNK to chatMachine.`);
+		sendChat({ type: 'RECEIVE_CHUNK', payload: { id, content } });
 	};
 
 	const chatFinishHandler = async (e: Event) => {
 		const { id } = (e as CustomEvent).detail;
-		console.log(`Received chat finish event for message ID ${id}`);
-		chatStreaming = false;
-        // finishedMessages is now implicitly handled by the TTS queue becoming empty
+		console.log(`[CallOverlay] Received chat:finish event for message ID ${id}. Sending FINISH_STREAM to chatMachine.`);
+		chatStreaming = false; // Reset local flag
+		// Send finish event to chatMachine
+		sendChat({ type: 'FINISH_STREAM', payload: { id } });
 	};
 
-    // --- Reactive Effects for STT Machine ---
+	// --- Reactive Effects ---
 
-    // Wire up MediaRecorder events from STT context
+	// Call Session Machine: Trigger activation when overlay becomes visible
+	let overlayJustOpened = false;
 	$: {
-		const recorder = $sttSnapshot.context.mediaRecorder;
-		if (recorder) {
-			recorder.ondataavailable = (event: BlobEvent) => {
-				if (event.data.size > 0 && $sttSnapshot.matches('recording')) {
-					// Send data to STT machine
-					console.log(`[CallOverlay] Sending RECORDING_DATA_AVAILABLE, size: ${event.data.size}`);
-					sendStt({ type: 'RECORDING_DATA_AVAILABLE', data: event.data });
-				}
-			};
-			recorder.onstop = () => {
-				console.log('MediaRecorder stopped (native onstop). STT Machine State:', $sttSnapshot.value);
-			};
+		if ($showCallOverlay && !overlayJustOpened && $callSnapshot?.matches('idle')) {
+			console.log('CallOverlay opened, activating session...');
+			sendCall({ type: 'ACTIVATE' });
+			overlayJustOpened = true;
+		} else if (!$showCallOverlay && overlayJustOpened) {
+			overlayJustOpened = false;
 		}
 	}
 
-    // Call Session Machine: Trigger activation when overlay becomes visible
-    let overlayJustOpened = false; // Flag to prevent re-triggering on hot reload
-    $: {
-        if ($showCallOverlay && !overlayJustOpened && $callSnapshot?.matches('idle')) {
-            console.log("CallOverlay opened, activating session...");
-            // Send ACTIVATE instead of OUTGOING_CALL, no payload needed
-            sendCall({ type: 'ACTIVATE' });
-            overlayJustOpened = true; // Set flag
-        } else if (!$showCallOverlay && overlayJustOpened) {
-            overlayJustOpened = false; // Reset flag when overlay closes
-        }
-    }
+	// STT Manager: Handle transcription result -> Trigger Chat Machine
+	let previousFinalizedText: string | null = null;
+	$: {
+		const currentFinalizedText = $sttManagerSnapshot.context.lastFinalizedText;
+		if (
+			currentFinalizedText &&
+			currentFinalizedText !== previousFinalizedText &&
+			currentFinalizedText.trim() !== ''
+		) {
+			console.log('[CallOverlay] STT Manager Finalized Text:', currentFinalizedText);
 
-    // STT Machine: Handle transcription result
-    let previousSttState = $sttSnapshot.value;
-    $: {
-        if (previousSttState !== 'transcribed' && $sttSnapshot.matches('transcribed')) {
-            const transcribedText = $sttSnapshot.context.transcribedText;
-            console.log('[CallOverlay] STT Transcribed:', transcribedText);
-            if (transcribedText && transcribedText.trim() !== '') {
-                // Stop any ongoing TTS before submitting new prompt
-                sendTts({ type: 'INTERRUPT' });
+			// Stop any ongoing TTS before submitting new prompt
+			sendTts({ type: 'INTERRUPT' });
 
-                // Add screenshot if camera is on
-                if (camera && cameraStream) {
-					const imageUrl = takeScreenshot();
-					files = imageUrl ? [{ type: 'image', url: imageUrl }] : [];
+			// Add screenshot if camera is on
+			if (camera && cameraStream) {
+				const imageUrl = takeScreenshot();
+				files = imageUrl ? [{ type: 'image', url: imageUrl }] : [];
 				} else {
-					files = [];
+				files = [];
+			}
+
+			// Submit the finalized text via Chat Machine
+			// loading = true; // Remove local loading
+			console.log('[CallOverlay] Sending SUBMIT_PROMPT to chatMachine...');
+			sendChat({ type: 'SUBMIT_PROMPT', payload: { prompt: currentFinalizedText } });
+
+		} else if (
+			currentFinalizedText === '' && // Handle explicitly empty finalized text (e.g., silence in standard mode)
+			previousFinalizedText !== '' // Check if it just became empty
+		) {
+			files = [];
+			console.log('[CallOverlay] Empty transcription result received.');
+			toast.info("Couldn't hear anything clearly.");
+		}
+		previousFinalizedText = currentFinalizedText;
+	}
+
+	// Wire up MediaRecorder events from the active STT child machine context
+	$: {
+		const childSnapshot = $sttManagerSnapshot.context.childRef?.getSnapshot();
+		// Check if the child is the standard STT machine and has a mediaRecorder
+		if (
+			$sttManagerSnapshot.matches('standardActive') &&
+			childSnapshot?.context &&
+			'mediaRecorder' in childSnapshot.context // Type guard
+		) {
+			const recorder = (childSnapshot.context as SttContext).mediaRecorder;
+			if (recorder) {
+				recorder.ondataavailable = (event: BlobEvent) => {
+					// Send data available event back TO THE CHILD machine
+					// We need the childRef to send the event directly to it
+					const childActorRef = $sttManagerSnapshot.context.childRef;
+					if (event.data.size > 0 && childActorRef && childSnapshot.matches('recording')) { // Check child state
+						console.log(`[CallOverlay] Sending RECORDING_DATA_AVAILABLE to child, size: ${event.data.size}`);
+						childActorRef.send({ type: 'RECORDING_DATA_AVAILABLE', data: event.data });
+					}
+				};
+				recorder.onstop = () => {
+					// This might be handled internally by sttMachine already, log for confirmation
+					console.log('[CallOverlay] MediaRecorder stopped (native onstop). Child State:', childSnapshot?.value);
+					// Optionally send STOP event to child? Depends on sttMachine logic.
+				};
+				 recorder.onstart = () => {
+					 console.log('[CallOverlay] MediaRecorder started (native onstart). Child State:', childSnapshot?.value);
+				 };
+				 recorder.onerror = (event: Event) => {
+					 console.error('[CallOverlay] MediaRecorder error:', event);
+					 // Send error to child?
+					 const childActorRef = $sttManagerSnapshot.context.childRef;
+					 if (childActorRef) {
+						 // Assuming sttMachine handles a generic error event or a specific recorder error
+						 childActorRef.send({ type: 'RECORDER_ERROR', error: (event as any).error || 'Unknown recorder error' });
+					 }
+				 };
+			}
+		}
+		// Potential cleanup needed if the recorder instance changes or disappears?
+		// This $: block will re-run, potentially re-attaching listeners.
+		// Proper cleanup might involve tracking the recorder instance and removing listeners in onDestroy or when the instance changes.
+	}
+
+	// Call State Controlled STT Start/Stop (Using STT Manager)
+	let previousCallState = $callSnapshot.value;
+	$: {
+		if (previousCallState !== 'active' && $callSnapshot.matches('active')) {
+			// Call became active, start STT Manager
+			console.log('[CallOverlay] Call active, starting STT Manager...');
+			sendSttManager({ type: 'START_LISTENING', payload: { token: localStorage.token } });
+		} else if (previousCallState === 'active' && !$callSnapshot.matches('active')) {
+			// Call is no longer active, stop STT Manager
+			console.log('[CallOverlay] Call inactive, stopping STT Manager...');
+			sendSttManager({ type: 'STOP_LISTENING' }); // Or RESET
+			sendSttManager({ type: 'RESET' }); // Reset the manager fully
+		}
+		previousCallState = $callSnapshot.value;
+	}
+
+	// Reactive effect for STT engine config changes (using $:)
+	let currentEngineSetting = ($config as any)?.audio?.stt?.engine ?? 'whisper'; // Cast to any
+	$: {
+		const newEngine = ($config as any)?.audio?.stt?.engine ?? 'whisper'; // Cast to any
+		if (newEngine && newEngine !== currentEngineSetting) {
+			console.log(`[CallOverlay] STT Engine changed from ${currentEngineSetting} to ${newEngine}. Sending CONFIG_UPDATE.`);
+			sendSttManager({
+				type: 'CONFIG_UPDATE',
+				settings: {
+					sttEngine: newEngine,
+					token: localStorage.token // Re-send token
 				}
-
-                // Submit the transcribed text
-                loading = true; // Show loading indicator while submitting
-                console.log('[CallOverlay] Submitting prompt with transcribed text...');
-                submitPrompt(transcribedText, { _raw: true })
-                    .then((_responses: any) => {
-                        console.log('Assistant responses after STT:', _responses);
-                        // Responses might trigger TTS via chat events
-                    })
-                    .catch((error: any) => {
-                        console.error("Error submitting prompt after STT:", error);
-				        toast.error(`${error.message || error}`);
-                    })
-                    .finally(() => {
-                        loading = false;
-                        // Optionally send event back to STT machine to go back to listening?
-                        console.log('[CallOverlay] Prompt submission finished. Going back to listening.');
-                        sendStt({ type: 'START_LISTENING' });
 			});
-		} else {
-                // Handle empty transcription
-                files = [];
-                console.log('[CallOverlay] Empty transcription result, going back to listening.');
-				toast.info("Couldn't hear anything clearly.");
-                // Go back to listening state?
-                sendStt({ type: 'START_LISTENING' });
-            }
-        }
-        previousSttState = $sttSnapshot.value;
-    }
+			currentEngineSetting = newEngine; // Update current setting after sending event
+		}
+	}
 
-    // --- Call State Controlled STT Start/Stop ---
-    let previousCallState = $callSnapshot.value;
-    $: {
-        if (previousCallState !== 'active' && $callSnapshot.matches('active')) {
-            // Call became active, start STT
-            console.log('[CallOverlay] Call active, starting STT...');
-            sendStt({ type: 'START_LISTENING', payload: { token: localStorage.token } });
-        } else if (previousCallState === 'active' && !$callSnapshot.matches('active')) {
-            // Call is no longer active, stop STT
-            console.log('[CallOverlay] Call inactive, stopping STT...');
-            sendStt({ type: 'STOP_LISTENING' }); // Or RESET depending on desired behavior
-            // Maybe also reset the STT machine completely?
-             sendStt({ type: 'RESET' });
-        }
-        previousCallState = $callSnapshot.value;
-    }
+	// Reactive effect for token changes (using $:)
+	let currentToken = localStorage.token;
+	$: {
+		const newToken = localStorage.token;
+		if (newToken && newToken !== currentToken) {
+			console.log(`[CallOverlay] API Token changed. Sending CONFIG_UPDATE.`);
+			sendSttManager({
+				type: 'CONFIG_UPDATE',
+				settings: {
+					sttEngine: ($config as any)?.audio?.stt?.engine ?? 'whisper', // Cast to any
+					token: newToken
+				}
+			});
+			// Also update TTS machine token
+			sendTts({
+				type: 'UPDATE_CONFIG',
+				config: { apiConfig: { token: newToken, modelId, chatId } }
+			});
+			currentToken = newToken; // Update current token after sending events
+		}
+	}
 
-    // --- Lifecycle ---
+	// --- Lifecycle ---
 
 	onMount(() => {
-		// ... (Wake Lock logic remains the same)
+		// Wake Lock logic
 		const setWakeLock = async () => {
 			try {
 				wakeLock = await navigator.wakeLock.request('screen');
@@ -362,7 +418,7 @@
 					console.log('Wake Lock released');
 				});
 			} catch (err) {
-				console.log("Wake Lock request failed:", err);
+				console.log('Wake Lock request failed:', err);
 			}
 		};
 
@@ -377,63 +433,47 @@
 
 		model = $models.find((m: any) => m.id === modelId);
 
-        // Update TTS machine config (token might be available now)
-         sendTts({
-             type: 'UPDATE_CONFIG',
-             config: {
-                 apiConfig: { token: localStorage.token, modelId, chatId }
-                 // Pass other config if needed
-             }
-         });
+		// Update TTS machine config initially
+		sendTts({
+			type: 'UPDATE_CONFIG',
+			config: {
+				apiConfig: { token: localStorage.token, modelId, chatId }
+			}
+		});
 
-		// Attach chat event listeners
+		// Attach chat event listeners (these now interact with chatMachine/ttsMachine)
 		eventTarget.addEventListener('chat:start', chatStartHandler);
 		eventTarget.addEventListener('chat', chatEventHandler);
 		eventTarget.addEventListener('chat:finish', chatFinishHandler);
 
-		// Cleanup function
-		return () => {
-			console.log("CallOverlay unmounting - cleanup initiated");
-
-			// Stop state machines
-			// REMOVE: sendCall({ type: 'END_CALL' });
-            // Stop/Reset STT Machine
-            sendStt({ type: 'STOP_LISTENING' }); // Or RESET?
-            sendStt({ type: 'RESET' });
-
-			sendTts({ type: 'INTERRUPT' }); // Interrupt any ongoing TTS
-			sendTts({ type: 'RESET' });    // Clear queue and state
-
-			stopCamera(); // Ensure camera stops
-
-			// Remove event listeners
-			eventTarget.removeEventListener('chat:start', chatStartHandler);
-			eventTarget.removeEventListener('chat', chatEventHandler);
-			eventTarget.removeEventListener('chat:finish', chatFinishHandler);
-
-			// Release wake lock
-			if (wakeLock) {
-				wakeLock.release();
-				wakeLock = null;
-			}
-		};
+		// Cleanup function (no return needed from onMount in Svelte 5+)
 	});
 
-	onDestroy(async () => {
-		console.log("CallOverlay onDestroy called");
-		// Ensure machines stop and resources are released
-		// REMOVE: sendCall({ type: 'END_CALL' });
-        // Stop/Reset STT Machine
-        sendStt({ type: 'STOP_LISTENING' });
-        sendStt({ type: 'RESET' });
+	onDestroy(() => {
+		console.log('CallOverlay unmounting - cleanup initiated');
 
-		await stopCamera();
+		// Stop/Reset STT Manager
+		sendSttManager({ type: 'STOP_LISTENING' });
+		sendSttManager({ type: 'RESET' });
+
+		sendTts({ type: 'INTERRUPT' });
+		sendTts({ type: 'RESET' });
+
+		stopCamera();
+
+		eventTarget.removeEventListener('chat:start', chatStartHandler);
+		eventTarget.removeEventListener('chat', chatEventHandler);
+		eventTarget.removeEventListener('chat:finish', chatFinishHandler);
 
 		if (wakeLock) {
 			wakeLock.release().catch((e: any) => console.error("Error releasing wake lock on destroy:", e));
 			wakeLock = null;
 		}
+
+		// Reset chat machine on destroy?
+		sendChat({ type: 'RESET' });
 	});
+
 </script>
 
 {#if $showCallOverlay}
@@ -445,32 +485,28 @@
 			<button
 				type="button"
 				class="flex justify-center items-center w-full h-20 min-h-20"
-				on:click={() => {
-					// Interrupt TTS if speaking
-					if (assistantSpeaking) {
-						sendTts({ type: 'INTERRUPT' });
-					}
-				}}
+				on:click={() => { if (assistantSpeaking) sendTts({ type: 'INTERRUPT' }) }}
 				title={assistantSpeaking ? $i18n.t('Tap to interrupt') : ''}
 			>
 				{#if currentEmoji}
+					<!-- Emoji display -->
 					<div
 						class="transition-all rounded-full text-center"
-						style="font-size:{$sttSnapshot.context.rmsLevel * 100 > 4 ? '4.5' : $sttSnapshot.context.rmsLevel * 100 > 2 ? '4.25' : $sttSnapshot.context.rmsLevel * 100 > 1 ? '3.75' : '3.5'}rem; width: 100%;"
+						style="font-size:{sttManagerContext.rmsLevel * 100 > 4 ? '4.5' : sttManagerContext.rmsLevel * 100 > 2 ? '4.25' : sttManagerContext.rmsLevel * 100 > 1 ? '3.75' : '3.5'}rem; width: 100%;"
 					>
 						{currentEmoji}
 					</div>
-                {:else if loading || $sttSnapshot.matches('recording') || assistantSpeaking || $ttsSnapshot.matches('fetchingAudio')}
-					<!-- Show spinner while loading transcription, recording, assistant speaking, or fetching audio -->
-                    <svg
-                        class="size-12 {loading ? 'text-gray-900 dark:text-gray-400' : assistantSpeaking ? 'text-green-500' : 'text-blue-500'}"
+				{:else if isChatLoading || assistantSpeaking || $ttsSnapshot.matches('fetchingAudio') || sttManagerContext.isRecording}
+					<!-- Spinner display -->
+					<svg
+						class="size-12 {isChatLoading ? 'text-gray-900 dark:text-gray-400' : assistantSpeaking ? 'text-green-500' : sttManagerContext.isRecording ? 'text-red-500' : 'text-blue-500'}"
 						viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
 						<style>.spinner_qM83{animation:spinner_8HQG 1.05s infinite}.spinner_oXPr{animation-delay:.1s}.spinner_ZTLf{animation-delay:.2s}@keyframes spinner_8HQG{0%,57.14%{animation-timing-function:cubic-bezier(.33,.66,.66,1);transform:translate(0)}28.57%{animation-timing-function:cubic-bezier(.33,0,.66,.33);transform:translateY(-6px)}100%{transform:translate(0)}}</style><circle class="spinner_qM83" cx="4" cy="12" r="3"/><circle class="spinner_qM83 spinner_oXPr" cx="12" cy="12" r="3"/><circle class="spinner_qM83 spinner_ZTLf" cx="20" cy="12" r="3"/>
 					</svg>
 				{:else}
-					<!-- Profile image / Listening indicator (based on STT machine state) -->
+					<!-- Profile image / Listening indicator (based on STT Manager context) -->
 					<div
-						class="transition-all rounded-full bg-cover bg-center bg-no-repeat {$sttSnapshot.matches('listening') || $sttSnapshot.matches('recording') ? 'ring-2 ring-blue-500 ring-offset-2 dark:ring-offset-gray-800' : ''} {$sttSnapshot.context.rmsLevel * 100 > 4 ? ' size-[4.5rem]' : $sttSnapshot.context.rmsLevel * 100 > 2 ? ' size-16' : $sttSnapshot.context.rmsLevel * 100 > 1 ? 'size-14' : 'size-12'} {(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? '' : 'bg-black dark:bg-white'}"
+						class="transition-all rounded-full bg-cover bg-center bg-no-repeat {sttManagerContext.isListening ? 'ring-2 ring-blue-500 ring-offset-2 dark:ring-offset-gray-800' : ''} {sttManagerContext.rmsLevel * 100 > 4 ? ' size-[4.5rem]' : sttManagerContext.rmsLevel * 100 > 2 ? ' size-16' : sttManagerContext.rmsLevel * 100 > 1 ? 'size-14' : 'size-12'} {(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? '' : 'bg-black dark:bg-white'}"
 						style={(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png'
 							? `background-image: url('${model?.info?.meta?.profile_image_url}');`
 							: ''}
@@ -486,37 +522,33 @@
 				<button
 					type="button"
 					class="relative flex justify-center items-center"
-					on:click={() => {
-                        // Interrupt TTS if speaking
-						if (assistantSpeaking) {
-                            sendTts({ type: 'INTERRUPT' });
-						}
-					}}
+					on:click={() => { if (assistantSpeaking) sendTts({ type: 'INTERRUPT' }) }}
 					title={assistantSpeaking ? $i18n.t('Tap to interrupt') : ''}
 				>
 					{#if currentEmoji}
+						<!-- Emoji display -->
 						<div
 							class="transition-all rounded-full text-center"
-							style="font-size:{$sttSnapshot.context.rmsLevel * 100 > 4 ? '13' : $sttSnapshot.context.rmsLevel * 100 > 2 ? '12' : $sttSnapshot.context.rmsLevel * 100 > 1 ? '11.5' : '11'}rem; width:100%;"
+							style="font-size:{sttManagerContext.rmsLevel * 100 > 4 ? '13' : sttManagerContext.rmsLevel * 100 > 2 ? '12' : sttManagerContext.rmsLevel * 100 > 1 ? '11.5' : '11'}rem; width:100%;"
 						>
 							{currentEmoji}
 						</div>
-                     {:else if loading || assistantSpeaking || $ttsSnapshot.matches('fetchingAudio')}
+					{:else if isChatLoading || assistantSpeaking || $ttsSnapshot.matches('fetchingAudio')}
 						<!-- Loading/Thinking spinner (large) -->
-						<svg class="size-44 text-gray-900 dark:text-gray-400" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+						<svg class="size-44 {isChatLoading ? 'text-gray-900 dark:text-gray-400' : 'text-blue-500'}" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
 							<style>.spinner_qM83{animation:spinner_8HQG 1.05s infinite}.spinner_oXPr{animation-delay:.1s}.spinner_ZTLf{animation-delay:.2s}@keyframes spinner_8HQG{0%,57.14%{animation-timing-function:cubic-bezier(.33,.66,.66,1);transform:translate(0)}28.57%{animation-timing-function:cubic-bezier(.33,0,.66,.33);transform:translateY(-6px)}100%{transform:translate(0)}}</style><circle class="spinner_qM83" cx="4" cy="12" r="3"/><circle class="spinner_qM83 spinner_oXPr" cx="12" cy="12" r="3"/><circle class="spinner_qM83 spinner_ZTLf" cx="20" cy="12" r="3"/>
 						</svg>
 					{:else}
-						<!-- Profile image / Listening indicator (based on STT machine state) -->
+						<!-- Profile image / Listening indicator (based on STT Manager context) -->
 						<div
-							class="transition-all rounded-full bg-cover bg-center bg-no-repeat {$sttSnapshot.matches('listening') || $sttSnapshot.matches('recording') ? 'ring-4 ring-blue-500 ring-offset-4 dark:ring-offset-gray-800' : ''} {$sttSnapshot.context.rmsLevel * 100 > 4 ? ' size-52' : $sttSnapshot.context.rmsLevel * 100 > 2 ? 'size-48' : $sttSnapshot.context.rmsLevel * 100 > 1 ? 'size-44' : 'size-40'} {(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? '' : 'bg-black dark:bg-white'}"
+							class="transition-all rounded-full bg-cover bg-center bg-no-repeat {sttManagerContext.isListening ? 'ring-4 ring-blue-500 ring-offset-4 dark:ring-offset-gray-800' : ''} {sttManagerContext.rmsLevel * 100 > 4 ? ' size-52' : sttManagerContext.rmsLevel * 100 > 2 ? 'size-48' : sttManagerContext.rmsLevel * 100 > 1 ? 'size-44' : 'size-40'} {(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? '' : 'bg-black dark:bg-white'}"
 							style={(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png'
 								? `background-image: url('${model?.info?.meta?.profile_image_url}');`
 								: ''}
 						/>
 					{/if}
-					{#if $sttSnapshot.matches('listening') || $sttSnapshot.matches('recording')}
-						<!-- Microphone Icon Overlay when Listening/Recording (based on audio machine) -->
+					{#if sttManagerContext.isListening || sttManagerContext.isRecording}
+						<!-- Microphone Icon Overlay when Listening/Recording (based on STT Manager context) -->
 						<div class="absolute inset-0 flex justify-center items-center">
 							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="size-16 text-white/80 drop-shadow-lg">
 								<path d="M8.25 4.5a3.75 3.75 0 1 1 7.5 0v8.25a3.75 3.75 0 1 1-7.5 0V4.5Z" />
@@ -526,7 +558,7 @@
 					{/if}
 				</button>
 			{:else}
-                <!-- Camera View -->
+				<!-- Camera View -->
 				<div class="relative flex video-container w-full max-h-full pt-2 pb-4 md:py-6 px-2 h-full">
 					<video id="camera-feed" bind:this={videoElement} autoplay class="rounded-2xl h-full min-w-full object-cover object-center" playsinline muted />
 					<canvas id="camera-canvas" bind:this={canvasElement} style="display:none;" />
@@ -535,6 +567,12 @@
 							<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" class="size-6"><path d="M5.28 4.22a.75.75 0 0 0-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 1 0 1.06 1.06L8 9.06l2.72 2.72a.75.75 0 1 0 1.06-1.06L9.06 8l2.72-2.72a.75.75 0 0 0-1.06-1.06L8 6.94 5.28 4.22Z" /></svg>
 						</button>
 					</div>
+					<!-- Display current segment from STT Manager -->
+					{#if sttManagerContext.currentSegment}
+					<div class="absolute bottom-4 left-4 right-4 bg-black/50 backdrop-blur-sm text-white text-center p-2 rounded-lg text-sm">
+						{sttManagerContext.currentSegment}
+					</div>
+					{/if}
 				</div>
 			{/if}
 		</div>
@@ -559,34 +597,47 @@
 			</div>
 
 			<!-- Center Status Text -->
-			<div>
-				<button class="cursor-default" on:click={() => { if (assistantSpeaking) { sendTts({ type: 'INTERRUPT' }); } }}>
-					<div class=" line-clamp-1 text-sm font-medium text-center px-4">
-						{#if $callSnapshot.matches('error')}
-                            <span class="text-red-500">{$i18n.t('Call Error')}: {$callSnapshot.context.errorMessage ?? 'Unknown'}</span>
-                        {:else if $sttSnapshot.matches('error')}
-                             <span class="text-red-500">{$i18n.t('STT Error')}: {$sttSnapshot.context.errorMessage ?? 'Unknown'}</span>
-						{:else if loading}
+			<div class="text-center min-w-0 flex-1 px-2">
+				<button class="cursor-default truncate w-full" on:click={() => { if (assistantSpeaking) sendTts({ type: 'INTERRUPT' }) }}>
+					<div class=" line-clamp-1 text-sm font-medium">
+						{#if sttManagerContext.isListening || sttManagerContext.isRecording}
+							{$i18n.t('Listening...')}
+						{:else if $callSnapshot.matches('error')}
+							<span class="text-red-500">{$i18n.t('Call Error')}: {$callSnapshot.context.errorMessage ?? 'Unknown'}</span>
+						{:else if sttManagerContext.errorMessage}
+							<span class="text-red-500">{$i18n.t('STT Error')}: {sttManagerContext.errorMessage}</span>
+						{:else if $chatSnapshot.matches('error')}
+							<span class="text-red-500">{$i18n.t('Chat Error')}: {$chatSnapshot.context.errorMessage ?? 'Unknown'}</span>
+						{:else if isChatLoading}
 							{$i18n.t('Thinking...')}
 						{:else if assistantSpeaking}
 							{$i18n.t('Tap to interrupt')}
-						{:else if $sttSnapshot.matches('listening') || $sttSnapshot.matches('recording')}
-							{$i18n.t('Listening...')}
-                        {:else if $ttsSnapshot.matches('fetchingAudio')}
-                             {$i18n.t('Preparing audio...')}
-						{:else if $callSnapshot.matches('active') && !assistantSpeaking && !$sttSnapshot.matches('listening') && !$sttSnapshot.matches('recording')}
-                            {$i18n.t('Ready')}
+						{:else if $ttsSnapshot.matches('fetchingAudio')}
+							{$i18n.t('Preparing audio...')}
+						{:else if $callSnapshot.matches('active')}
+							{$i18n.t('Ready')}
 						{:else}
-							<!-- Idle state (when overlay closed) or default -->
-                            {model?.name ?? $i18n.t('Ready')}
+							{model?.name ?? $i18n.t('Initializing...')}
 						{/if}
 					</div>
 				</button>
+				<!-- Display current segment when not in camera view -->
+				{#if !camera}
+                    {#if $chatSnapshot.context.currentResponseContent}
+                        <p class="text-sm text-gray-500 dark:text-gray-400 mt-1 truncate">
+                            { $chatSnapshot.context.currentResponseContent }
+                        </p>
+                    {:else if sttManagerContext.currentSegment}
+                        <p class="text-sm text-gray-500 dark:text-gray-400 mt-1 truncate">
+                            {sttManagerContext.currentSegment}
+                        </p>
+                    {/if}
+                {/if}
 			</div>
 
 			<!-- Right Button: Close Overlay -->
 			<div>
-				<button class=" p-3 rounded-full bg-red-500 text-white hover:bg-red-600 transition-colors" title="End Call" on:click={() => { /* sendAudio({ type: 'STOP' }); */ sendStt({ type: 'STOP_LISTENING' }); sendStt({ type: 'RESET' }); sendTts({ type: 'INTERRUPT' }); sendTts({ type: 'RESET' }); /* sendCall({ type: 'END_CALL' }); */ showCallOverlay.set(false); dispatch('close'); }} type="button">
+				<button class=" p-3 rounded-full bg-red-500 text-white hover:bg-red-600 transition-colors" title="End Call" on:click={() => { sendSttManager({ type: 'STOP_LISTENING' }); sendSttManager({ type: 'RESET' }); sendTts({ type: 'INTERRUPT' }); sendTts({ type: 'RESET' }); showCallOverlay.set(false); dispatch('close'); }} type="button">
 					<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="size-5"><path fill-rule="evenodd" d="M1.5 4.5a3 3 0 0 1 3-3h1.372c.86 0 1.61.586 1.819 1.42l1.105 4.423a1.875 1.875 0 0 1-.694 1.955l-1.293.97c-.135.101-.164.29-.077.431 1.57 2.796 4.03 5.256 6.827 6.827.14.086.33.057.43-.078l.97-1.293a1.875 1.875 0 0 1 1.955-.694l4.423 1.105c.834.209 1.42.959 1.42 1.82V19.5a3 3 0 0 1-3 3h-2.25C8.552 22.5 1.5 15.448 1.5 6.75V4.5Z" clip-rule="evenodd" /></svg>
 				</button>
 			</div>

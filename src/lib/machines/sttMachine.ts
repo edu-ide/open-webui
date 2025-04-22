@@ -1,4 +1,4 @@
-import { setup, assign, fromPromise, log, sendTo, type ActorRefFrom, fromCallback, type DoneActorEvent } from 'xstate';
+import { setup, assign, fromPromise, log, sendTo, type ActorRefFrom, fromCallback, type DoneActorEvent, sendParent } from 'xstate';
 import { blobToFile } from '$lib/utils'; // Assuming utils exists
 
 // --- Types ---
@@ -391,13 +391,17 @@ export const sttMachine = setup({
     initial: 'idle',
     states: {
         idle: {
-            entry: 'resetContext', // Ensure context is clean on entering idle
+            entry: ['resetContext', log('[sttMachine] Entering idle state')], // Add log
             on: {
-                START_LISTENING: { target: 'permissionPending', actions: 'updateToken' }
+                START_LISTENING: {
+                    target: 'permissionPending',
+                    // Add log action here
+                    actions: [log('[sttMachine] Received START_LISTENING in idle state'), 'updateToken']
+                }
             }
         },
         permissionPending: {
-            entry: log('Requesting mic permission...'),
+            entry: log('[sttMachine] Entering permissionPending state...'),
             invoke: {
                 id: 'micPermissionActor',
                 src: 'micPermissionActor',
@@ -436,7 +440,7 @@ export const sttMachine = setup({
             }
         },
         initializing: {
-            entry: log('Initializing recorder...'),
+            entry: log('[sttMachine] Entering initializing state...'),
             // Use single invoke with proper onDone/onError handling
             invoke: {
                 id: 'initializeRecorderActor',
@@ -476,7 +480,10 @@ export const sttMachine = setup({
         },
         listening: {
             id: 'listeningState',
-            entry: [log('Entered listening state'), log('Listening for sound...'), 'clearError'],
+            entry: [
+                log('[sttMachine] Entering listening state...'),
+                'clearError'
+            ],
             invoke: {
                  id: 'audioAnalysisService',
                  src: 'audioAnalysisService',
@@ -497,13 +504,21 @@ export const sttMachine = setup({
                      actions: 'assignAnalysisUpdate'
                  },
                 STOP_LISTENING: { target: 'idle', actions: 'closeAudioStream' },
-                RESET: { target: 'idle', actions: ['closeAudioStream', 'resetContext'] }
+                RESET: { target: 'idle', actions: ['closeAudioStream', 'resetContext'] },
+                // Add handler for START_LISTENING here too? Maybe just log.
+                START_LISTENING: {
+                    actions: log('[sttMachine] Received START_LISTENING while already listening (ignored)')
+                }
             },
             exit: log('Exiting listening state') // Stop analysis service implicitly via state exit?
         },
         recording: {
             id: 'recordingState',
-            entry: [log('Entered recording state'), log('Recording started...'), 'startRecorder'],
+            entry: [
+                log('[sttMachine] Entering recording state...'),
+                log('Recording started...'),
+                'startRecorder'
+            ],
              invoke: {
                  id: 'audioAnalysisService', // Reuse ID to ensure only one runs
                  src: 'audioAnalysisService',
@@ -537,38 +552,43 @@ export const sttMachine = setup({
             invoke: {
                 id: 'transcriptionActor',
                 src: 'transcriptionActor',
-                input: ({ context }) => ({
-                    chunks: context.audioChunks,
-                    transcribeFn: context.transcribeFn,
-                    token: context.apiToken
-                }),
+                input: ({ context }) => ({ chunks: context.audioChunks, transcribeFn: context.transcribeFn, token: context.apiToken }),
                 onDone: {
                     target: 'transcribed',
-                    // Replace named action string with inline assign logic
-                    actions: assign(
-                        ({ event }: { event: DoneActorEvent<{ text: string }> }) => {
-                            // Check if output exists and has a text property
-                            if (event.output && typeof event.output.text === 'string') {
-                                console.log(`[sttMachine] Assigning transcribed text: "${event.output.text}"`);
+                    // Make actions an array
+                    actions: [
+                        // First, assign the text to context
+                        assign(
+                            ({ event }: { event: DoneActorEvent<{ text: string }> }) => {
+                                if (event.output && typeof event.output.text === 'string') {
+                                    console.log(`[sttMachine] Assigning transcribed text: "${event.output.text}"`);
+                                    return {
+                                        transcribedText: event.output.text,
+                                        errorMessage: null,
+                                        audioChunks: []
+                                    };
+                                }
+                                console.warn('[sttMachine] Transcription completed but no text found in event output:', event.output);
                                 return {
-                                    transcribedText: event.output.text,
-                                    errorMessage: null, // Clear error
-                                    audioChunks: [] // Clear chunks
+                                    transcribedText: null,
+                                    errorMessage: 'Transcription successful but no text received.',
+                                    audioChunks: []
                                 };
                             }
-                            console.warn('[sttMachine] Transcription completed but no text found in event output:', event.output);
-                            return {
-                                transcribedText: null, // Assign null if no text found
-                                errorMessage: 'Transcription successful but no text received.',
-                                audioChunks: [] // Clear chunks even if text is missing
-                            };
-                        }
-                    )
+                        ),
+                        // Second, send result to parent
+                        sendParent( ({ event } : { event: DoneActorEvent<{ text: string }> }) => {
+                            if (event.output && typeof event.output.text === 'string') {
+                                console.log(`[sttMachine] Sending STT_RESULT to parent: "${event.output.text}"`);
+                                return { type: 'STT_RESULT', text: event.output.text };
+                            }
+                            // Handle cases where output or text might be missing (though assign action should handle this)
+                            console.log('[sttMachine] No valid output/text found, not sending STT_RESULT to parent.');
+                            return { type: 'ignore' };
+                        })
+                    ]
                 },
-                onError: {
-                    target: 'error',
-                    actions: ['assignError', 'closeAudioStream']
-                }
+                onError: { target: 'error', actions: ['assignError', 'closeAudioStream'] }
             },
             // If no transcribeFn or token, go to error state immediately
             always: {
@@ -582,10 +602,12 @@ export const sttMachine = setup({
             }
         },
         transcribed: {
-            entry: log( ({context}) => `Transcription: ${context.transcribedText}`),
-            // Stay here until explicitly stopped or reset, allowing access to transcribedText
+            entry: [log( ({context}) => `[sttMachine] Entering transcribed state. Text: ${context.transcribedText}`)], // Modify log
             on: {
-                START_LISTENING: { target: 'listening' }, // Restart listening
+                START_LISTENING: {
+                    target: 'listening',
+                    actions: log('[sttMachine] Received START_LISTENING in transcribed state, restarting.')
+                },
                 STOP_LISTENING: { target: 'idle', actions: 'closeAudioStream' },
                 RESET: { target: 'idle', actions: ['closeAudioStream', 'resetContext'] }
             }
