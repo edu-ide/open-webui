@@ -265,16 +265,6 @@ export const sttMachine = setup({
         startRecorder: ({ context }) => {
             if (context.mediaRecorder && context.mediaRecorder.state === 'inactive') {
                 console.log('[sttWorker] Starting media recorder with timeslice...');
-                // Listen for data using the machine's event handler
-                context.mediaRecorder.ondataavailable = (event) => {
-                    if (event.data.size > 0) {
-                         // Send event to self - requires self ref? No, machine handles this directly.
-                         // Need to use `self.send()` or pass `sendBack`?
-                         // Let's handle recorder events directly in the state definition for now.
-                         console.log("[sttWorker] Recorder data available, size:", event.data.size); // Log here
-                         // This won't work directly. Need to set up listener in the state definition.
-                    }
-                 };
                 context.mediaRecorder.start(500); // Use a reasonable timeslice
             } else {
                 console.warn('[sttWorker] Recorder not ready or already recording.');
@@ -306,10 +296,11 @@ export const sttMachine = setup({
         stopRecorder: ({ context }) => {
             if (context.mediaRecorder && context.mediaRecorder.state === 'recording') {
                 console.log('[sttWorker] Stopping media recorder...');
-                 // Remove listeners before stopping? Maybe not necessary if worker is stopping anyway.
-                 // context.mediaRecorder.ondataavailable = null;
-                 // context.mediaRecorder.onstop = null;
-                 // context.mediaRecorder.onerror = null;
+                 // Remove listeners before stopping for robustness
+                 context.mediaRecorder.ondataavailable = null;
+                 context.mediaRecorder.onstop = null;
+                 context.mediaRecorder.onerror = null;
+                 // Stop the recorder
                 context.mediaRecorder.stop();
             } else if (context.mediaRecorder && context.mediaRecorder.state === 'inactive'){
                  console.log('[sttWorker] Recorder was already inactive.');
@@ -344,20 +335,24 @@ export const sttMachine = setup({
         // --- New Actions for Parent Communication ---
         sendSilenceToParent: sendParent(({ self }) => ({ type: 'WORKER_SILENCE_DETECTED', workerRef: self })),
         sendResultToParent: sendParent(
-            ({ context, event }) => {
+            ({ context, event, self }) => {
                 // Explicitly type the event for this specific context
                 const doneEvent = event as DoneActorEvent<{ text: string }>;
+                let textToSend = ''; // Default to empty string
+
                 // Check the correct event type AND if the output exists and has text
                 if (doneEvent.type === 'xstate.done.actor.transcriptionActor' && typeof doneEvent.output?.text === 'string') {
-                    console.log(`[sttWorker] Sending WORKER_TRANSCRIPTION_RESULT: "${doneEvent.output.text}"`);
-                    return { type: 'WORKER_TRANSCRIPTION_RESULT', text: doneEvent.output.text };
+                    textToSend = doneEvent.output.text;
+                } else {
+                    // Log if transcription succeeded but returned nothing or unexpected type
+                    console.log('[sttWorker] No valid text found in transcription result, sending empty result.');
                 }
-                console.log('[sttWorker] No text found in transcription result, sending empty result.');
-                // Send empty text if transcription succeeded but returned nothing (still check type)
-                if (doneEvent.type === 'xstate.done.actor.transcriptionActor') {
-                    return { type: 'WORKER_TRANSCRIPTION_RESULT', text: '' };
-                }
-                return { type: 'ignore' }; // Should not happen if called correctly
+
+                console.log(`[sttWorker] Sending WORKER_TRANSCRIPTION_RESULT: "${textToSend}" from worker ${self.id}`);
+                // Include workerRef in the event payload
+                return { type: 'WORKER_TRANSCRIPTION_RESULT', text: textToSend, workerRef: self };
+
+                // return { type: 'ignore' }; // Should not happen if called correctly
             }
         ),
         sendErrorToParent: sendParent(
@@ -423,7 +418,11 @@ export const sttMachine = setup({
                 input: ({ context }) => ({ stream: context.audioStream }),
                 onDone: {
                     target: 'listening',
-                    actions: [{ type: 'assignRecorder' }, log('[sttWorker] Recorder initialized, moving to listening.')]
+                    actions: [
+                        { type: 'assignRecorder' },
+                        { type: 'setupRecorderListeners' },
+                        log('[sttWorker] Recorder initialized, moving to listening.')
+                    ]
                 },
                 onError: {
                     target: 'stopped',
@@ -499,19 +498,22 @@ export const sttMachine = setup({
                 // Event sent internally from setupRecorderListeners
                 RECORDING_DATA_AVAILABLE: { actions: 'appendAudioChunk' },
                 SILENCE_DETECTED: {
-                     target: 'waitingForProcessing', // Go to new state
-                     guard: 'hasAudioChunks',
-                     // Send event to parent INSTEAD of transitioning directly
-                     actions: ['sendSilenceToParent', log('[sttWorker] SILENCE_DETECTED, notifying parent.')]
-                 },
-                 _AUDIO_ANALYSIS_UPDATE: {
-                     actions: 'assignAnalysisUpdate'
-                 },
-                 // Stop command from manager
-                 STOP: {
-                     target: 'stopped', // Stop immediately if told to
-                     actions: ['stopRecorder', log('[sttWorker] Received STOP during recording.')]
-                 }
+                    target: 'waitingForProcessing', // Go to new state
+                    guard: 'hasAudioChunks',
+                    // Send event to parent INSTEAD of transitioning directly
+                    actions: [
+                        log('[sttWorker] SILENCE_DETECTED received in recording state. Sending event to parent...'),
+                        'sendSilenceToParent'
+                    ]
+                },
+                _AUDIO_ANALYSIS_UPDATE: {
+                    actions: 'assignAnalysisUpdate'
+                },
+                // Stop command from manager
+                STOP: {
+                    target: 'stopped', // Stop immediately if told to
+                    actions: ['stopRecorder', log('[sttWorker] Received STOP during recording.')]
+                }
             },
             exit: ['stopRecorder', log('[sttWorker] Exiting recording state.')] // Stop recorder when leaving
         },
@@ -523,7 +525,7 @@ export const sttMachine = setup({
                  PROCESS_CHUNKS: {
                      target: 'processing',
                      // Guard shouldn't be needed here if SILENCE_DETECTED guard worked
-                     actions: log('[sttWorker] Received PROCESS_CHUNKS, moving to processing.')
+                     actions: log('[sttWorker] SUCCESS: Received PROCESS_CHUNKS in waiting state, moving to processing.')
                  },
                  // Also handle STOP while waiting
                  STOP: {
@@ -536,7 +538,7 @@ export const sttMachine = setup({
         processing: {
              id: 'processingState',
             // Clear chunks just before invoking actor
-            entry: [log('[sttWorker] Entering processing state...'), 'clearAudioChunks'],
+            entry: [log('[sttWorker] Entering processing state...')],
             invoke: {
                 id: 'transcriptionActor',
                 src: 'transcriptionActor',
@@ -548,11 +550,22 @@ export const sttMachine = setup({
                 }),
                 onDone: {
                     target: 'stopped', // Worker is done after successful transcription
-                    actions: ['sendResultToParent', log('[sttWorker] Transcription successful, stopping.')]
+                    actions: [
+                        'stopRecorder',
+                        'clearAudioChunks',
+                        'sendResultToParent',
+                        log('[sttWorker] Transcription successful, stopping and cleaning up recorder.')
+                    ]
                 },
                 onError: {
                     target: 'stopped', // Worker stops on transcription error
-                    actions: ['assignError', 'sendErrorToParent', log('[sttWorker] Transcription failed, stopping.')]
+                    actions: [
+                        'stopRecorder',
+                        'clearAudioChunks',
+                        'assignError',
+                        'sendErrorToParent',
+                        log('[sttWorker] Transcription failed, stopping and cleaning up recorder.')
+                    ]
                 }
             },
             // Remove always guard (manager responsibility)

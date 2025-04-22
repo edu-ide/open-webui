@@ -7,14 +7,14 @@ import {
 	type ActorRefFrom,
 	type AnyActorLogic,
 	type EventObject,
-	type MachineContext
+	type MachineContext,
+	type AnyActorRef
 } from 'xstate';
 
-// Import the manager machine(s) this configurator will spawn
-import { sttManagerMachine, type SttManagerContext } from './sttManagerMachine';
-// Placeholder for engine-specific managers if needed later
-// import { webSpeechManagerMachine } from './webSpeechManagerMachine';
-// import { whisperLiveManagerMachine } from './whisperLiveManagerMachine';
+// Import the manager/worker machines this configurator will spawn
+import { sttManagerMachine, type SttManagerContext } from './sttManagerMachine'; // Whisper Manager
+import { webSpeechWorkerMachine, type WebSpeechWorkerContext } from './webSpeechWorkerMachine'; // Web Speech Worker
+import { whisperLiveSttMachine, type WhisperLiveContext, type WhisperLiveInput } from './whisperLiveSttMachine'; // Whisper Live Worker
 
 // <<< 모듈 로드 로그 >>>
 console.log('[sttConfiguratorMachine.ts] Module loaded');
@@ -23,29 +23,37 @@ console.log('[sttConfiguratorMachine.ts] Module loaded');
 
 export type SttEngine = 'whisper' | 'web' | 'whisper-live' | 'none';
 
+// Union type for the spawned actor reference
+type SpawnedActor =
+	| ActorRefFrom<typeof sttManagerMachine>
+	| ActorRefFrom<typeof webSpeechWorkerMachine>
+	| ActorRefFrom<typeof whisperLiveSttMachine>;
+
 export interface SttConfiguratorContext extends MachineContext {
 	sttEngineSetting: SttEngine;
 	apiToken: string | null;
-	transcribeFn?: SttManagerContext['transcribeFn']; // Needed for whisper manager
-	// Reference to the spawned manager actor
-	managerRef: ActorRefFrom<typeof sttManagerMachine> | null; // Use specific type for now
-	// Potentially mirror some state from manager for UI
-	// isListening: boolean;
-	// errorMessage: string | null;
+	transcribeFn?: SttManagerContext['transcribeFn']; // Needed ONLY for whisper manager
+	whisperLiveWsUrl?: string; // Optional URL for Whisper Live
+	// Reference to the spawned actor (manager or worker)
+	managerRef: SpawnedActor | null; // Use the union type
+	// Mirrored state from the active worker/manager
+	workerIsListening: boolean;
+	workerError: string | null;
+	workerCurrentTranscript: string | null;
+	workerFinalTranscript: string | null;
 }
 
 export type SttConfiguratorEvent =
-	| { type: 'CONFIG_UPDATE'; settings: Partial<Pick<SttConfiguratorContext, 'sttEngineSetting' | 'apiToken' | 'transcribeFn'>> }
-	| { type: 'START_SESSION'; initialConfig?: Partial<Pick<SttConfiguratorContext, 'sttEngineSetting' | 'apiToken' | 'transcribeFn'>> }
+	| { type: 'CONFIG_UPDATE'; settings: Partial<Pick<SttConfiguratorContext, 'sttEngineSetting' | 'apiToken' | 'transcribeFn' | 'whisperLiveWsUrl'>> }
+	| { type: 'START_SESSION'; initialConfig?: Partial<SttConfiguratorContext> }
 	| { type: 'STOP_SESSION' }
-	// Events to forward to the manager
-	| { type: 'START_CALL' } // Payload removed, assuming token/fn are already configured
-	| { type: 'STOP_CALL' }
-	// Events received from the manager (if needed for state mirroring)
-	// | { type: 'MANAGER_STATUS_UPDATE', status: Partial<Pick<SttConfiguratorContext, 'isListening' | 'errorMessage'>> }
-	// Internal events
-	| { type: 'error.actor.manager' };
-
+	| { type: 'START_CALL' } // Forwarded to applicable actors
+	| { type: 'STOP_CALL' } // Forwarded to applicable actors
+	// Events received FROM spawned actors
+	| { type: 'WORKER_STATE_UPDATE'; state: any } // Keep 'any' for now, or create a union type
+	| { type: 'MANAGER_TRANSCRIPTION_UPDATE'; finalTranscript: string }
+	| { type: 'WORKER_ERROR'; error: string }
+	| { type: 'error.actor.manager' }; // Generic actor error
 
 // --- Machine Setup ---
 
@@ -53,67 +61,43 @@ export const sttConfiguratorMachine = setup({
 	types: {
 		context: {} as SttConfiguratorContext,
 		events: {} as SttConfiguratorEvent,
-		input: {} as Partial<Pick<SttConfiguratorContext, 'sttEngineSetting' | 'apiToken' | 'transcribeFn'>>,
+		input: {} as Partial<SttConfiguratorContext>,
 	},
 	actors: {
-		// Define manager actor logic sources here if needed, or rely on imported machines
-		// whisperManager: sttManagerMachine, // Example if using specific actor names
+		// Define actor logic sources here if needed (not needed for spawning existing machines)
 	},
 	actions: {
 		assignConfig: assign({
 			sttEngineSetting: ({ context, event }) => {
-				console.log('[Configurator Assign] Event type:', event.type);
-				let newEngine: SttEngine | undefined | '' = undefined;
-				if (event.type === 'CONFIG_UPDATE') {
-					newEngine = event.settings.sttEngineSetting;
-					console.log('[Configurator Assign] Received sttEngineSetting from CONFIG_UPDATE:', newEngine);
-				} else if (event.type === 'START_SESSION') {
-					newEngine = event.initialConfig?.sttEngineSetting;
-					console.log('[Configurator Assign] Received sttEngineSetting from START_SESSION:', newEngine);
-				}
-
-				// If the received engine is empty string or falsy, default to 'whisper' or keep existing
-				if (newEngine === '') {
-					console.log('[Configurator Assign] Received empty string for engine, defaulting to \'whisper\'.');
-					return 'whisper';
-				} else if (newEngine && ['whisper', 'web', 'whisper-live', 'none'].includes(newEngine)) {
-					return newEngine; // Return valid engine setting
-				} else {
-					// If newEngine is undefined or invalid, keep the existing context value
-					console.log('[Configurator Assign] No valid engine setting received, keeping existing:', context.sttEngineSetting);
-					return context.sttEngineSetting;
-				}
+				if (event.type === 'CONFIG_UPDATE' && event.settings.sttEngineSetting) return event.settings.sttEngineSetting;
+				if (event.type === 'START_SESSION' && event.initialConfig?.sttEngineSetting) return event.initialConfig.sttEngineSetting;
+				return context.sttEngineSetting;
 			},
 			apiToken: ({ context, event }) => {
-				if (event.type === 'CONFIG_UPDATE') {
-					console.log('[Configurator Assign] Assigning apiToken from CONFIG_UPDATE:', event.settings.apiToken);
-					return event.settings.apiToken ?? context.apiToken;
-				} else if (event.type === 'START_SESSION') {
-					console.log('[Configurator Assign] Assigning apiToken from START_SESSION:', event.initialConfig?.apiToken);
-					return event.initialConfig?.apiToken ?? context.apiToken;
-				}
+				if (event.type === 'CONFIG_UPDATE' && event.settings.apiToken) return event.settings.apiToken;
+				if (event.type === 'START_SESSION' && event.initialConfig?.apiToken) return event.initialConfig.apiToken;
 				return context.apiToken;
 			},
 			transcribeFn: ({ context, event }) => {
-				if (event.type === 'CONFIG_UPDATE') {
-					console.log('[Configurator Assign] Assigning transcribeFn from CONFIG_UPDATE (exists):', !!event.settings.transcribeFn);
-					return event.settings.transcribeFn ?? context.transcribeFn;
-				} else if (event.type === 'START_SESSION') {
-					console.log('[Configurator Assign] Assigning transcribeFn from START_SESSION (exists):', !!event.initialConfig?.transcribeFn);
-					return event.initialConfig?.transcribeFn ?? context.transcribeFn;
+				// Only assign if relevant for whisper engine
+				if (context.sttEngineSetting === 'whisper') {
+					if (event.type === 'CONFIG_UPDATE' && event.settings.transcribeFn) return event.settings.transcribeFn;
+					if (event.type === 'START_SESSION' && event.initialConfig?.transcribeFn) return event.initialConfig.transcribeFn;
 				}
 				return context.transcribeFn;
 			},
+			whisperLiveWsUrl: ({ context, event }) => {
+				// Assign URL if relevant for whisper-live engine
+				if (context.sttEngineSetting === 'whisper-live') {
+					if (event.type === 'CONFIG_UPDATE' && event.settings.whisperLiveWsUrl) return event.settings.whisperLiveWsUrl;
+					if (event.type === 'START_SESSION' && event.initialConfig?.whisperLiveWsUrl) return event.initialConfig.whisperLiveWsUrl;
+				}
+				return context.whisperLiveWsUrl;
+			}
 		}),
-		spawnManager: assign({
-			managerRef: ({ context, spawn }) => {
-				const commonInput = {
-					apiToken: context.apiToken,
-					// Pass any other common config needed by all manager types
-				};
-
-				// Log context values right before spawning
-				console.log(`[Configurator Spawn] Attempting spawn. Engine: '${context.sttEngineSetting}', Token: '${context.apiToken ? '***' : 'null'}', Fn Exists: ${!!context.transcribeFn}`);
+		spawnActor: assign({ // Renamed from spawnManager
+			managerRef: ({ context, spawn, self }): SpawnedActor | null => { // Use union type
+				console.log(`[Configurator] Attempting to spawn actor for engine type: ${context.sttEngineSetting}`);
 
 				try {
 					switch (context.sttEngineSetting) {
@@ -122,166 +106,234 @@ export const sttConfiguratorMachine = setup({
 								console.error('[Configurator] Cannot spawn Whisper manager: missing apiToken or transcribeFn.');
 								return null;
 							}
-							const whisperInput = { ...commonInput, transcribeFn: context.transcribeFn };
-							const whisperManager = spawn(sttManagerMachine, {
-								input: whisperInput
-							});
-							console.log(`[Configurator] Manager spawned: ${whisperManager.id}`);
+							const whisperInput = { apiToken: context.apiToken, transcribeFn: context.transcribeFn };
+							const whisperManager = spawn(sttManagerMachine, { input: whisperInput });
+							console.log(`[Configurator] Whisper Manager spawned: ${whisperManager.id}`);
 							return whisperManager;
 
 						case 'web':
-							console.warn('[Configurator] Web Speech Manager logic not yet implemented. Spawning Whisper as fallback.');
-							if (!context.apiToken || !context.transcribeFn) {
-								console.error('[Configurator] Cannot spawn fallback Whisper manager: missing apiToken or transcribeFn.');
-								return null;
-							}
-							// Fallback to Whisper for now
-							const webFallbackInput = { ...commonInput, transcribeFn: context.transcribeFn };
-							const webFallbackManager = spawn(sttManagerMachine, {
-								input: webFallbackInput
-							});
-							console.log(`[Configurator] Fallback manager spawned: ${webFallbackManager.id}`);
-							return webFallbackManager;
+							const webInput: Pick<WebSpeechWorkerContext, 'parent' | 'lang' | 'continuous' | 'interimResults'> = {
+								parent: self,
+								lang: 'ko-KR', // Make configurable?
+								continuous: true,
+								interimResults: true,
+							};
+							const webWorker = spawn(webSpeechWorkerMachine, { input: webInput });
+							console.log(`[Configurator] WebSpeech Worker spawned directly: ${webWorker.id}`);
+							return webWorker;
 
 						case 'whisper-live':
-							console.warn('[Configurator] Whisper Live Manager logic not yet implemented. Spawning Whisper as fallback.');
-							if (!context.apiToken || !context.transcribeFn) {
-								console.error('[Configurator] Cannot spawn fallback Whisper manager: missing apiToken or transcribeFn.');
+							// Remove fallback logic
+							// console.warn('[Configurator] Whisper Live logic not yet implemented. Spawning Whisper as fallback.');
+							// console.warn('[Configurator] Whisper Live logic not yet implemented. Spawning Whisper as fallback.');
+							const wsUrl = context.whisperLiveWsUrl || 'ws://localhost:9090'; // Use configured URL or default placeholder
+							console.log(`[Configurator] Spawning Whisper Live Worker. URL: ${wsUrl}`);
+							if (!wsUrl) {
+								console.error('[Configurator] Cannot spawn Whisper Live worker: Missing WebSocket URL (whisperLiveWsUrl).');
 								return null;
 							}
-							// Fallback to Whisper for now
-							const liveFallbackInput = { ...commonInput, transcribeFn: context.transcribeFn };
-							const liveFallbackManager = spawn(sttManagerMachine, {
-								input: liveFallbackInput
-							});
-							console.log(`[Configurator] Fallback manager spawned: ${liveFallbackManager.id}`);
-							return liveFallbackManager;
+							// Check for API token (optional based on server needs)
+							// if (!context.apiToken) { ... }
+							const liveInput: WhisperLiveInput = { // Use the specific input type
+								wsUrl: wsUrl,
+								apiToken: context.apiToken,
+								parent: self // Pass self as parent
+							};
+							const liveWorker = spawn(whisperLiveSttMachine, { input: liveInput });
+							console.log(`[Configurator] Whisper Live worker spawned: ${liveWorker.id}`);
+							return liveWorker;
 
 						case 'none':
 						default:
-							console.error(`[Configurator] Cannot spawn manager: Invalid or 'none' STT engine setting: '${context.sttEngineSetting}'`);
+							console.error(`[Configurator] Cannot spawn actor: Invalid or 'none' STT engine setting: ${context.sttEngineSetting}`);
 							return null;
 					}
 				} catch (error) {
-					console.error('[Configurator] Error during manager spawn process:', error);
+					console.error('[Configurator] Error during actor spawn process:', error);
 					return null;
 				}
 			}
 		}),
-		stopManager: assign({
+		stopActor: assign({ // Renamed from stopManager
 			managerRef: ({ context }) => {
 				if (context.managerRef) {
-					console.log(`[Configurator] Stopping manager: ${context.managerRef.id}`);
+					console.log(`[Configurator] Stopping actor: ${context.managerRef.id}`);
 					stopChild(context.managerRef);
 				}
 				return null;
-			}
+			},
+			workerIsListening: false,
+			workerError: null,
+			workerCurrentTranscript: null,
+			workerFinalTranscript: null
 		}),
-		// Forward event, return undefined if type is unexpected (should be filtered by guard)
-		forwardToManager: sendTo(
+		// Start the spawned worker/manager
+		startWorker: sendTo(
+			({ context }) => context.managerRef!,
+			{ type: 'START_LISTENING' } // Event to start the worker
+		),
+		// Forward commands applicable to specific workers/managers
+		forwardCommand: sendTo(
 			({ context }) => context.managerRef!,
 			({ event, context }) => {
-				if (event.type === 'START_CALL') {
-					if (!context.apiToken || !context.transcribeFn) {
-						console.error('[Configurator] Cannot forward START_CALL: missing token or transcribeFn in configurator context.');
-						return undefined; // Don't send anything if config is missing
+				const targetActor = context.managerRef;
+				if (!targetActor) return undefined;
+
+				// Determine target type (more robustly if possible, e.g., checking machine definition)
+				const targetIsWhisperManager = context.sttEngineSetting === 'whisper';
+				const targetIsWebWorker = context.sttEngineSetting === 'web';
+				const targetIsLiveWorker = context.sttEngineSetting === 'whisper-live';
+
+				// Commands for Whisper Manager
+				if (targetIsWhisperManager) {
+					if (event.type === 'START_CALL') {
+						if (!context.apiToken || !context.transcribeFn) return undefined;
+						return { type: 'START_CALL', payload: { token: context.apiToken, transcribeFn: context.transcribeFn } };
+					} else if (event.type === 'STOP_CALL') {
+						return { type: 'STOP_CALL' };
 					}
-					// Ensure the payload matches the SttManagerEvent definition
-					const payload: { token: string | null, transcribeFn: SttManagerContext['transcribeFn'] } = {
-						token: context.apiToken,
-						transcribeFn: context.transcribeFn
-					};
-					return {
-						type: 'START_CALL',
-						payload
-					};
-				} else if (event.type === 'STOP_CALL') {
-					return { type: 'STOP_CALL' };
 				}
-				// Guard should prevent this, but return undefined just in case
-				console.error('[Configurator] Unexpected event type in forwardToManager, returning undefined:', event);
-				return undefined;
+				// Commands for WebSpeech Worker
+				else if (targetIsWebWorker) {
+					if (event.type === 'START_CALL') { // Map START_CALL to START
+						return { type: 'START' };
+					} else if (event.type === 'STOP_CALL') { // Map STOP_CALL to STOP
+						return { type: 'STOP' };
+					}
+				}
+				// Commands for Whisper Live Worker
+				else if (targetIsLiveWorker) {
+					if (event.type === 'START_CALL') { // Map START_CALL to START_LISTENING
+						return { type: 'START_LISTENING' };
+					} else if (event.type === 'STOP_CALL') { // Map STOP_CALL to STOP_LISTENING
+						return { type: 'STOP_LISTENING' };
+					}
+					// Do NOT forward AUDIO_CHUNK here
+				}
+
+				console.warn(`[Configurator] Event type ${event.type} not forwarded to actor ${context.managerRef?.id}.`);
+				return undefined; // Explicitly return undefined if not forwarded
 			}
 		),
+		logSpawn: log('[Configurator] Entering active state, attempting to spawn actor...'),
+		// Assign state received from ANY worker/manager
+		assignWorkerState: assign({
+			workerIsListening: ({ context, event }) => {
+				if (event.type === 'WORKER_STATE_UPDATE' && typeof event.state?.isListening === 'boolean') {
+					return event.state.isListening;
+				}
+				return context.workerIsListening;
+			},
+			workerError: ({ context, event }) => {
+				if (event.type === 'WORKER_STATE_UPDATE') {
+					// Check if error is null or a string
+					return typeof event.state?.error === 'string' || event.state?.error === null ? event.state.error : context.workerError;
+				}
+				if (event.type === 'WORKER_ERROR') { // Handle direct error event
+					return event.error ?? 'Unknown worker error';
+				}
+				return context.workerError;
+			},
+			workerCurrentTranscript: ({ context, event }) => {
+				if (event.type === 'WORKER_STATE_UPDATE') {
+					return typeof event.state?.currentTranscript === 'string' || event.state?.currentTranscript === null ? event.state.currentTranscript : context.workerCurrentTranscript;
+				}
+				return context.workerCurrentTranscript;
+			},
+			workerFinalTranscript: ({ context, event }) => {
+				// Reset final transcript if state update implies it (e.g., error, not listening)
+				if (event.type === 'WORKER_STATE_UPDATE') {
+					if (event.state?.error || !event.state?.isListening) {
+						// Keep existing final transcript unless explicitly cleared by MANAGER_TRANSCRIPTION_UPDATE?
+						// return null; // Maybe clear it?
+					}
+					// WORKER_STATE_UPDATE might carry the final transcript for some workers
+					if (typeof event.state?.finalTranscript === 'string') {
+						return event.state.finalTranscript;
+					}
+				}
+				// MANAGER_TRANSCRIPTION_UPDATE handles final transcript for Whisper Manager/Live
+				if (event.type === 'MANAGER_TRANSCRIPTION_UPDATE') {
+					return event.finalTranscript;
+				}
+				return context.workerFinalTranscript;
+			}
+		}),
+		clearWorkerState: assign({
+			workerIsListening: false,
+			workerError: null,
+			workerCurrentTranscript: null,
+			workerFinalTranscript: null
+		}),
 	},
 	guards: {
-		hasManagerRef: ({ context }) => context.managerRef !== null,
-		shouldForwardEvent: ({ event }) => ['START_CALL', 'STOP_CALL'].includes(event.type),
+		hasActorRef: ({ context }) => context.managerRef !== null, // Renamed from hasManagerRef
+		shouldForwardCommand: ({ event }) => ['START_CALL', 'STOP_CALL'].includes(event.type),
+		spawnFailed: ({ context }) => context.managerRef === null && context.sttEngineSetting !== 'none',
+		// Guard to check if the event is a direct error from the spawned actor
+		isActorErrorEvent: ({ event }) => event.type === 'error.actor.manager' || event.type === 'WORKER_ERROR',
 	},
 }).createMachine({
 	id: 'sttConfigurator',
-	context: ({ input }) => {
-		const initialEngineSetting = input?.sttEngineSetting;
-		const validatedEngineSetting = 
-			initialEngineSetting && ['whisper', 'web', 'whisper-live', 'none'].includes(initialEngineSetting)
-			? initialEngineSetting 
-			: 'whisper'; // Default to 'whisper' if input is empty, null, undefined, or invalid
-		console.log(`[Configurator Context] Initializing. Input engine: '${initialEngineSetting}', Validated engine: '${validatedEngineSetting}'`);
-
-		return {
-			sttEngineSetting: validatedEngineSetting,
-			apiToken: input?.apiToken ?? null,
-			transcribeFn: input?.transcribeFn,
-			managerRef: null,
-		}
-	},
+	context: ({ input }) => ({
+		sttEngineSetting: input?.sttEngineSetting ?? 'none',
+		apiToken: input?.apiToken ?? null,
+		transcribeFn: input?.transcribeFn, // Should only be relevant if engine is whisper
+		whisperLiveWsUrl: input?.whisperLiveWsUrl, // Added for live engine
+		managerRef: null,
+		workerIsListening: false,
+		workerError: null,
+		workerCurrentTranscript: null,
+		workerFinalTranscript: null,
+	}),
 	initial: 'idle',
 	states: {
 		idle: {
-			entry: ['stopManager'], // Ensure cleanup on entering idle
+			entry: log('[Configurator] Entering idle state.'),
 			on: {
-				CONFIG_UPDATE: {
-					actions: ['assignConfig']
-				},
 				START_SESSION: {
 					target: 'active',
-					actions: ['assignConfig'] // Assign config passed with START_SESSION
+					actions: ['assignConfig']
 				}
 			}
 		},
 		active: {
-			entry: ['spawnManager', log('[Configurator] Entering active state, spawning manager...')],
-			always: {
-				target: 'error',
-				guard: ({ context }) => context.managerRef === null // If spawning failed
-			},
+			entry: [
+				log('[Configurator] Entering active state, attempting to spawn actor...'),
+				'spawnActor',
+				'startWorker' // Add the action to start the spawned actor
+			] as const,
+			exit: ['stopActor', log('[Configurator] Exiting active state, stopping actor.')] as const,
 			on: {
-				STOP_SESSION: {
-					target: 'idle',
-					actions: [log('[Configurator] STOP_SESSION received.')]
-				},
+				STOP_SESSION: { target: 'idle' },
 				CONFIG_UPDATE: {
-					// Option 1: Re-spawn manager immediately (might interrupt ongoing process)
-					// target: 'active',
-					// actions: ['assignConfig', 'stopManager', 'spawnManager']
-					// Option 2: Just update config, manager might handle it internally or on next start
-					actions: ['assignConfig', log('[Configurator] Config updated while active. Manager restart might be needed manually via STOP/START_SESSION.')]
+					target: 'active', // Re-enter to potentially respawn with new config
+					actions: ['assignConfig']
 				},
-				// Forward relevant events
+				// Handle updates FROM the worker/manager
+				WORKER_STATE_UPDATE: { actions: 'assignWorkerState' },
+				MANAGER_TRANSCRIPTION_UPDATE: { actions: 'assignWorkerState' }, // Use same action
+				WORKER_ERROR: { target: 'error', actions: 'assignWorkerState' }, // Assign error message from event
+				'error.actor.manager': { target: 'error', actions: [assign({ errorMessage: 'Actor terminated unexpectedly.' }), 'clearWorkerState'] }, // Handle generic actor error
+
+				// Forward commands TO the worker/manager
 				'*': {
-					guard: 'shouldForwardEvent',
-					actions: ['forwardToManager']
-				},
-				'error.actor.manager': {
-					target: 'error',
-					actions: [log('[Configurator] Error received from manager actor.')]
+					guard: 'shouldForwardCommand',
+					actions: 'forwardCommand'
 				}
 			},
-			exit: ['stopManager'] // Stop manager when leaving active state
 		},
 		error: {
-			entry: [log('[Configurator] Entering error state.')],
+			entry: [log('[Configurator] Entering error state.'), 'clearWorkerState'],
 			on: {
-				START_SESSION: {
-					target: 'active',
-					actions: ['assignConfig']
-				},
-				CONFIG_UPDATE: {
-					actions: ['assignConfig']
-				}
+				// Allow retry by restarting the session
+				START_SESSION: { target: 'active', actions: 'assignConfig' },
+				// Allow config update in error state before retry
+				CONFIG_UPDATE: { actions: 'assignConfig' }
 			}
 		}
 	}
 });
 
+console.log('[sttConfiguratorMachine.ts] Machine definition complete'); 
 console.log('[sttConfiguratorMachine.ts] Machine definition complete'); 

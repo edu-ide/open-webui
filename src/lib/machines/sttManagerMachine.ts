@@ -14,7 +14,8 @@ import {
 	type AssignArgs,
 	type Spawner,
 	type PromiseActorLogic,
-	type ErrorActorEvent
+	type ErrorActorEvent,
+	sendParent
 } from 'xstate';
 import { sttMachine, type SttContext, type SttEvent } from './sttMachine'; // Standard STT
 // import { whisperLiveSttMachine, type WhisperLiveContext } from './whisperLiveSttMachine'; // Comment out if not used
@@ -243,15 +244,11 @@ export const sttManagerMachine = setup({
 				}
 			}
 		}),
-		// Simplified handleSilenceAndSpawnNew - always spawns sttMachine (Whisper worker)
-		handleSilenceAndSpawnNew: assign({
+		// Keep the assign action for spawning/updating workers, maybe rename for clarity
+		spawnNewWorkerAndUpdateLists: assign({
 			activeWorker: ({ context, spawn, event, self }: AssignArgs<SttManagerContext, SttManagerEvent, any, any>) => {
+				// Spawn logic only
 				if (event.type !== 'WORKER_SILENCE_DETECTED') return context.activeWorker;
-
-				const silencedWorker = event.workerRef;
-
-				console.log(`[sttManager] Telling worker ${silencedWorker.id} to process chunks.`);
-				sendTo(silencedWorker, { type: 'PROCESS_CHUNKS' });
 
 				if (!context.managerAudioStream || !context.managerAudioStream.active) {
 					console.error('[sttManager] Cannot spawn new worker: inactive or missing audio stream.');
@@ -283,8 +280,9 @@ export const sttManagerMachine = setup({
 			},
 			processingWorkers: ({ context, event }) => {
 				if (event.type === 'WORKER_SILENCE_DETECTED') {
-					if (!context.processingWorkers.some(w => w.id === event.workerRef.id)) {
-						return [...context.processingWorkers, event.workerRef];
+					const workerRef = event.workerRef;
+					if (workerRef && !context.processingWorkers.some(w => w.id === workerRef.id)) {
+						return [...context.processingWorkers, workerRef];
 					}
 				}
 				return context.processingWorkers;
@@ -292,8 +290,11 @@ export const sttManagerMachine = setup({
 		}),
 		removeProcessedWorker: assign({
 			processingWorkers: ({ context, event }) => {
-				if (event.type === 'WORKER_TRANSCRIPTION_RESULT') {
+				if (event.type === 'WORKER_TRANSCRIPTION_RESULT' && event.workerRef) {
 					console.log(`[SttManager] Removing worker ${event.workerRef.id} from processing list.`);
+					return context.processingWorkers.filter(ref => ref.id !== event.workerRef.id);
+				} else if (event.type === 'WORKER_ERROR' && event.workerRef) {
+					console.log(`[SttManager] Removing errored worker ${event.workerRef.id} from processing list.`);
 					return context.processingWorkers.filter(ref => ref.id !== event.workerRef.id);
 				}
 				return context.processingWorkers;
@@ -331,7 +332,7 @@ export const sttManagerMachine = setup({
 		isPermissionSuccess: (context, event) => isMicPermissionSuccessEvent(event as SttManagerEvent),
 		isPermissionPlatformError: (context, event) => isMicPermissionPlatformErrorEvent(event as SttManagerEvent | ErrorActorEvent),
 		isPermissionDeniedError: (context, event) => isPermissionDeniedError(event as SttManagerEvent),
-		canSpawnNewWorker: ({ context }) => // Renamed from guard that checked engine
+		canSpawnNewWorker: ({ context }) =>
 			(!!context.managerAudioStream && context.managerAudioStream.active) &&
 			(!!context.apiToken && !!context.transcribeFn),
 	},
@@ -423,21 +424,38 @@ export const sttManagerMachine = setup({
 					guard: ({ context }) =>
 						(!!context.managerAudioStream && context.managerAudioStream.active) &&
 						(!!context.apiToken && !!context.transcribeFn),
-					actions: ['handleSilenceAndSpawnNew', log('[sttManager] Handled silence, spawned new worker.')]
+					// Define actions explicitly here
+					actions: [
+						log(({ event }) => `[sttManager] SUCCESS: Received WORKER_SILENCE_DETECTED from ${ (event as any).workerRef?.id }`),
+						log(({ event }) => `[sttManager] WORKER_SILENCE_DETECTED from ${ (event as any).workerRef?.id }. Sending PROCESS_CHUNKS...`),
+						// Send PROCESS_CHUNKS to the worker that detected silence
+						sendTo(
+							({ event }) => (event as any).workerRef, // Target the worker from the event
+							{ type: 'PROCESS_CHUNKS' }
+						),
+						// Assign new active worker and update processing list
+						{ type: 'spawnNewWorkerAndUpdateLists' },
+						log('[sttManager] Handled silence, spawned new worker.') // Log completion
+					]
 				},
 				WORKER_TRANSCRIPTION_RESULT: {
 					actions: [
 						{ type: 'assignFinalizedText' },
+						sendParent(({ context }) => ({
+							type: 'MANAGER_TRANSCRIPTION_UPDATE',
+							finalTranscript: context.finalTranscript
+						})),
 						'removeProcessedWorker',
-						stopChild(({ event }) => (event as { type: 'WORKER_TRANSCRIPTION_RESULT', workerRef: any }).workerRef),
-						log('[sttManager] Processed transcription result.')
+						stopChild(({ event }) => (event as any).workerRef),
+						log('[sttManager] Processed transcription result and notified parent.')
 					]
 				},
 				WORKER_ERROR: {
 					target: 'error',
 					actions: [
 						{ type: 'assignChildError' },
-						stopChild(({ event }) => (event as { type: 'WORKER_ERROR', workerRef: any }).workerRef),
+						'removeProcessedWorker',
+						stopChild(({ event }) => (event as any).workerRef),
 						log('[sttManager] Worker error occurred, transitioning to error state.')
 					]
 				},
