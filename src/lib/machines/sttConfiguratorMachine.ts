@@ -234,12 +234,28 @@ export const sttConfiguratorMachine = setup({
 				return context.workerCurrentTranscript;
 			},
 			workerFinalTranscript: ({ context, event }) => {
-				// Only update from MANAGER_TRANSCRIPTION_UPDATE
+				// Priority 1: Direct update from MANAGER_TRANSCRIPTION_UPDATE
 				if (event.type === 'MANAGER_TRANSCRIPTION_UPDATE') {
 					console.log(`[Configurator/AssignState] Updating finalTranscript from MANAGER_TRANSCRIPTION_UPDATE: ${event.finalTranscript}`);
-					return event.finalTranscript; // Can be string or null
+					// Accept string or null directly from this event
+					return event.finalTranscript;
 				}
-				// Keep existing value if no relevant update
+
+				// Priority 2: Update from WORKER_STATE_UPDATE only if it contains a valid string
+				if (event.type === 'WORKER_STATE_UPDATE') {
+					const finalTranscriptFromState = event.state?.finalTranscript;
+					// ONLY update if the state provides a non-null, non-empty string
+					if (typeof finalTranscriptFromState === 'string' && finalTranscriptFromState.trim() !== '') {
+						 console.log(`[Configurator/AssignState] Updating finalTranscript from WORKER_STATE_UPDATE (valid string): ${finalTranscriptFromState}`);
+						return finalTranscriptFromState;
+					}
+					 // Optionally log ignored null/empty updates from WORKER_STATE_UPDATE
+					 // else if (finalTranscriptFromState === null || finalTranscriptFromState === '') {
+					 //    console.log(`[Configurator/AssignState] Ignoring finalTranscript from WORKER_STATE_UPDATE (null/empty). Current: ${context.workerFinalTranscript}`);
+					 //}
+				}
+
+				// Otherwise, keep the existing value
 				return context.workerFinalTranscript;
 			},
 			workerRmsLevel: ({ context, event }) => {

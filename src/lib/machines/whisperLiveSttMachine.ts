@@ -400,7 +400,7 @@ export const whisperLiveSttMachine = setup({
 					use_vad: context.useVad,
 					...(context.useVad && {
 						vad_parameters: {
-							onset: 0.7, // <<< Increase onset threshold slightly >>>
+							onset: 0.5, // <<< Increase onset threshold slightly >>>
 						}
 					})
 				};
