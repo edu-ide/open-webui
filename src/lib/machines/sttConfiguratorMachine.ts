@@ -245,14 +245,12 @@ export const sttConfiguratorMachine = setup({
 					const finalTranscript = event.state?.finalTranscript;
 					// Assign if it's a string or null, otherwise keep existing
 					if (typeof finalTranscript === 'string' || finalTranscript === null) {
-						console.log(`[Configurator/AssignState] Updating finalTranscript from WORKER_STATE_UPDATE: ${finalTranscript}`); // Added log
 						return finalTranscript;
 					}
 				}
 				// Handle direct update event (e.g., from Whisper Manager/Live)
 				if (event.type === 'MANAGER_TRANSCRIPTION_UPDATE') {
 					// Directly assign the value (can be string or null)
-					console.log(`[Configurator/AssignState] Updating finalTranscript from MANAGER_TRANSCRIPTION_UPDATE: ${event.finalTranscript}`); // Added log
 					return event.finalTranscript;
 				}
 				// Keep existing value if no relevant update

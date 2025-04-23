@@ -624,11 +624,13 @@
 						</button>
 					</div>
 					<!-- Display current segment from configurator context -->
-					{#if $sttConfiguratorSnapshot.context.workerCurrentTranscript}
 					<div class="absolute bottom-4 left-4 right-4 bg-black/50 backdrop-blur-sm text-white text-center p-2 rounded-lg text-sm">
-						{$sttConfiguratorSnapshot.context.workerCurrentTranscript}
+						{#if $sttConfiguratorSnapshot.context.workerFinalTranscript && $sttConfiguratorSnapshot.context.workerFinalTranscript.trim() !== ''}
+							<span class="text-white">{$sttConfiguratorSnapshot.context.workerFinalTranscript}</span>
+						{:else if $sttConfiguratorSnapshot.context.workerCurrentTranscript && $sttConfiguratorSnapshot.context.workerCurrentTranscript.trim() !== ''}
+							<span class="text-white/80">{$sttConfiguratorSnapshot.context.workerCurrentTranscript}</span>
+						{/if}
 					</div>
-					{/if}
 				</div>
 			{/if}
 		</div>
@@ -681,15 +683,15 @@
 				</button>
 				<!-- Display current segment when not in camera view (Use workerCurrentTranscript) -->
 				{#if !camera}
-					{#if $chatSnapshot.context.currentResponseContent}
-						<p class="text-sm text-gray-500 dark:text-gray-400 mt-1 truncate">
-							{ $chatSnapshot.context.currentResponseContent }
-						</p>
-					{:else if $sttConfiguratorSnapshot.context.workerCurrentTranscript}
-						<p class="text-sm text-gray-500 dark:text-gray-400 mt-1 truncate">
-							{$sttConfiguratorSnapshot.context.workerCurrentTranscript}
-						</p>
-					{/if}
+					<p class="text-sm text-gray-500 dark:text-gray-400 mt-1 truncate min-h-[1.25rem]">
+						{#if $sttConfiguratorSnapshot.context.workerFinalTranscript && $sttConfiguratorSnapshot.context.workerFinalTranscript.trim() !== ''}
+							<span class="text-gray-900 dark:text-white">{$sttConfiguratorSnapshot.context.workerFinalTranscript}</span>
+						{:else if $sttConfiguratorSnapshot.context.workerCurrentTranscript && $sttConfiguratorSnapshot.context.workerCurrentTranscript.trim() !== ''}
+							<span class="text-gray-500 dark:text-gray-400">{$sttConfiguratorSnapshot.context.workerCurrentTranscript}</span>
+						{:else}
+							&nbsp;
+						{/if}
+					</p>
 				{/if}
 			</div>
 

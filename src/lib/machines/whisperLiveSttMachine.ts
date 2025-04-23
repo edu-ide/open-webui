@@ -1,4 +1,20 @@
-import { setup, assign, fromCallback, log, sendTo, type ActorRefFrom, sendParent, type AnyActorRef, fromPromise, type DoneActorEvent, type ErrorActorEvent, stopChild } from 'xstate';
+import {
+	setup,
+	assign,
+	fromCallback,
+	log,
+	sendTo,
+	type ActorRefFrom,
+	sendParent,
+	type AnyActorRef,
+	fromPromise,
+	type DoneActorEvent,
+	type ErrorActorEvent,
+	stopChild,
+	raise,
+	createMachine,
+	assign as assignWs
+} from 'xstate';
 // No 'ws' import needed for browser environment
 
 // --- Constants ---
@@ -44,8 +60,8 @@ export interface WhisperLiveContext {
 	audioWorkletNode: AudioWorkletNode | null;
 	isWorkletReady: boolean;
 	// WebSocket
-	connectionStatus: 'idle' | 'connecting' | 'initializing' | 'waiting_server' | 'connected' | 'disconnected' | 'error';
-	websocketActor: ActorRefFrom<typeof websocketActorLogic> | null;
+	connectionStatus: 'idle' | 'connecting' | 'waiting_server' | 'connected' | 'disconnected' | 'error';
+	websocketActor: ActorRefFrom<typeof webSocketConnectionMachine> | null;
 	isServerReady: boolean;
 	// Transcription
 	currentSegment: string | null;
@@ -53,6 +69,7 @@ export interface WhisperLiveContext {
 	errorMessage: string | null;
 	rmsLevel: number; // Added RMS level
 	isAudioProcessing: boolean; // Flag to track if audio input/worklet is active
+	isStopping: boolean; // Flag to indicate the actor is stopping
 }
 
 // All possible events the machine can handle
@@ -75,7 +92,7 @@ type WhisperLiveEvent =
 	| { type: 'WORKLET_ERROR'; error: string }
 	| { type: 'VAD_SPEECH_START' } // VAD event
 	| { type: 'VAD_SILENCE_START' } // VAD event
-	// Internal events: From WebSocket Actor
+	// Internal events: From WebSocket Machine
 	| { type: 'WEBSOCKET.CONNECTING' }
 	| { type: 'WEBSOCKET.OPEN' }
 	| { type: 'WEBSOCKET.CLOSE'; code?: number; reason?: string }
@@ -86,7 +103,7 @@ type WhisperLiveEvent =
 	| { type: 'SERVER_WAIT'; duration: number }
 	| { type: 'SERVER_DISCONNECT' }
 	| { type: 'LANGUAGE_DETECTED'; language: string }
-	// Internal command TO WebSocket Actor
+	// Internal command TO WebSocket Machine
 	| { type: 'SEND_CONFIG'; payload: any }
 	| { type: 'FINAL_TRANSCRIPT_RECEIVED' } // Internal event after final transcript
 	// Internal action type (for ignoring sendTo results)
@@ -146,119 +163,176 @@ const audioWorkletSetupActor = fromPromise<{ audioContext: AudioContext }>(async
 	}
 });
 
-// WebSocket Actor Logic (Handles connection and raw message passing)
-const websocketActorLogic = fromCallback<WhisperLiveEvent, { url: string, parentMachineId: string }>(({ sendBack, receive, input }) => {
-	console.log(`[WebSocketActor/${input.parentMachineId}] Starting with input:`, input);
-	let socket: WebSocket | null = null;
+// WebSocket Machine
 
-	const connect = () => {
-		if (socket && socket.readyState !== WebSocket.CLOSED) {
-            console.log(`[WebSocketActor/${input.parentMachineId}] Connect called but socket exists with state: ${socket.readyState}`);
-            return;
-        }
-		console.log(`[WebSocketActor/${input.parentMachineId}] Attempting connect to ${input.url}...`);
-		sendBack({ type: 'WEBSOCKET.CONNECTING' } as any);
-		try {
-			socket = new WebSocket(input.url);
+interface WebSocketMachineContext {
+	parent: AnyActorRef;
+	url: string;
+	configPayload: any; // Initial config from parent
+	clientId: string;
+	socket: WebSocket | null;
+	keepaliveIntervalId: ReturnType<typeof setInterval> | null;
+	keepaliveIntervalMs: number;
+	silentAudioChunk: ArrayBuffer; // Pre-generated silent audio
+	retries: number;
+}
 
-			socket.onopen = () => {
-                console.log(`[WebSocketActor/${input.parentMachineId}] WebSocket OPENED.`);
-                console.log(`[WebSocketActor/${input.parentMachineId}] Attempting to send WEBSOCKET.OPEN event back to machine.`);
-                sendBack({ type: 'WEBSOCKET.OPEN' } as any);
-            };
+type WebSocketMachineEvent =
+	// Internal events triggered by WebSocket callbacks
+	| { type: 'WEBSOCKET.INTERNAL.OPEN' }
+	| { type: 'WEBSOCKET.INTERNAL.MESSAGE'; data: any }
+	| { type: 'WEBSOCKET.INTERNAL.ERROR'; error: string }
+	| { type: 'WEBSOCKET.INTERNAL.CLOSE'; code?: number; reason?: string }
+	// Events from parent (whisperLiveSttMachine)
+	| { type: 'SEND_AUDIO'; data: ArrayBuffer }
+	| { type: 'STOP' }
+	| { type: 'SEND_SILENT_PING' };
 
-			socket.onmessage = (event: MessageEvent) => {
+// Note: Consider moving this machine to its own file later
+const webSocketConnectionMachine = setup({
+	types: {
+		context: {} as WebSocketMachineContext,
+		events: {} as WebSocketMachineEvent,
+		input: {} as { parent: AnyActorRef; url: string; configPayload: any; clientId: string }
+	},
+	actions: {
+		sendOpenToParent: sendParent({ type: 'WEBSOCKET.OPEN' }),
+		sendMessageToParent: sendParent(({ event }) => {
+			if (event.type === 'WEBSOCKET.INTERNAL.MESSAGE') {
+				return { type: 'WEBSOCKET.MESSAGE', data: event.data };
+			} return undefined;
+		}),
+		sendErrorToParent: sendParent(({ context, event }) => {
+			let errorMsg = 'Unknown WebSocket error';
+			if (event.type === 'WEBSOCKET.INTERNAL.ERROR') { errorMsg = event.error; }
+			console.error(`[WebSocketMachine/${context.clientId}] Sending WEBSOCKET.ERROR to parent: ${errorMsg}`);
+			return { type: 'WEBSOCKET.ERROR', error: errorMsg };
+		}),
+		sendCloseToParent: sendParent(({ event }) => {
+			if (event.type === 'WEBSOCKET.INTERNAL.CLOSE') {
+				return { type: 'WEBSOCKET.CLOSE', code: event.code, reason: event.reason };
+			} return undefined;
+		}),
+		connectWebSocket: assignWs(({ context, self }) => {
+			console.log(`[WebSocketMachine/${context.clientId}] Attempting connect to ${context.url}`);
+			try {
+				const socket = new WebSocket(context.url);
+				socket.onopen = () => { console.log(`[WebSocketMachine/${context.clientId}] WebSocket OPENED.`); self.send({ type: 'WEBSOCKET.INTERNAL.OPEN' }); };
+				socket.onmessage = (event) => { self.send({ type: 'WEBSOCKET.INTERNAL.MESSAGE', data: event.data }); };
+				socket.onerror = (event) => { console.error(`[WebSocketMachine/${context.clientId}] WebSocket ERROR:`, event); self.send({ type: 'WEBSOCKET.INTERNAL.ERROR', error: 'WebSocket error event occurred' }); };
+				socket.onclose = (event) => { console.log(`[WebSocketMachine/${context.clientId}] WebSocket CLOSED. Code: ${event.code}, Reason: ${event.reason}`); self.send({ type: 'WEBSOCKET.INTERNAL.CLOSE', code: event.code, reason: event.reason }); };
+				return { socket: socket, retries: 0 };
+			} catch (error: any) {
+				console.error(`[WebSocketMachine/${context.clientId}] Error creating WebSocket:`, error);
+				self.send({ type: 'WEBSOCKET.INTERNAL.ERROR', error: `WebSocket creation failed: ${error.message || 'Unknown'}` });
+				return { socket: null };
+			}
+		}),
+		sendConfig: ({ context, self }) => {
+			if (context.socket?.readyState === WebSocket.OPEN) {
 				try {
-                    console.log(`[WebSocketActor/${input.parentMachineId}] WebSocket MESSAGE received:`, event.data);
-                    // Send raw data back for parsing in the main machine
-                    sendBack({ type: 'WEBSOCKET.MESSAGE', data: event.data } as any);
-                 }
-				catch (e) {
-                    console.error(`[WebSocketActor/${input.parentMachineId}] Error processing message:`, e);
-                    sendBack({ type: 'WEBSOCKET.ERROR', error: 'Processing error' } as any);
-                }
-			};
-
-			socket.onerror = (event) => {
-                // Log the event itself for more details if possible
-                console.error(`[WebSocketActor/${input.parentMachineId}] WebSocket ERROR occurred:`, event);
-                sendBack({ type: 'WEBSOCKET.ERROR', error: 'WebSocket error event occurred' } as any);
-            };
-
-			socket.onclose = (event: CloseEvent) => {
-                console.log(`[WebSocketActor/${input.parentMachineId}] WebSocket CLOSED. Code: ${event.code}, Reason: ${event.reason}`);
-                sendBack({ type: 'WEBSOCKET.CLOSE', code: event.code, reason: event.reason } as any);
-                socket = null; // Clear socket ref on close
-            };
-
-		} catch (error: any) {
-			const message = error instanceof Error ? error.message : 'Unknown error';
-            console.error(`[WebSocketActor/${input.parentMachineId}] Error creating WebSocket:`, message, error);
-			sendBack({ type: 'WEBSOCKET.ERROR', error: `WebSocket creation failed: ${message}` } as any);
-		}
-	};
-
-	receive((event) => {
-        // Comment out or remove the log for frequent events like WORKLET_AUDIO_CHUNK
-        // console.log(`[WebSocketActor/${input.parentMachineId}] Received command from parent:`, event.type);
-		// Commands *to* this actor
-		if (event.type === 'START_LISTENING') {
-            console.log(`[WebSocketActor/${input.parentMachineId}] Received command from parent: START_LISTENING`);
-            connect();
-        }
-		else if (event.type === 'STOP_LISTENING') {
-            console.log(`[WebSocketActor/${input.parentMachineId}] Received command from parent: STOP_LISTENING`);
-			if (socket && socket.readyState === WebSocket.OPEN) socket.close(1000, 'Client stopped');
-		} else if (event.type === 'WORKLET_AUDIO_CHUNK') { // Handle audio chunk event from parent
-			console.log(`[WebSocketActor/${input.parentMachineId}] Received WORKLET_AUDIO_CHUNK from machine.`);
-			if (socket) {
-			    console.log(`[WebSocketActor/${input.parentMachineId}] Checking socket state before send: readyState = ${socket.readyState} (1 = OPEN)`);
+					console.log(`[WebSocketMachine/${context.clientId}] Sending config:`, context.configPayload);
+					context.socket.send(JSON.stringify(context.configPayload));
+				} catch (e: any) {
+					console.error(`[WebSocketMachine/${context.clientId}] Error sending config:`, e);
+					self.send({ type: 'WEBSOCKET.INTERNAL.ERROR', error: `Send config failed: ${e.message || 'Unknown'}` });
+				}
 			} else {
-			    console.error(`[WebSocketActor/${input.parentMachineId}] Cannot send audio chunk: socket is null!`);
-			    return; // 소켓이 없으면 더 이상 진행하지 않음
+				console.warn(`[WebSocketMachine/${context.clientId}] Cannot send config, socket not open.`);
+				self.send({ type: 'WEBSOCKET.INTERNAL.ERROR', error: 'Cannot send config, socket not open.' });
 			}
-			if (socket && socket.readyState === WebSocket.OPEN) {
+		},
+		sendAudioChunk: ({ context, event }) => {
+			if (event.type !== 'SEND_AUDIO') return;
+			if (context.socket?.readyState === WebSocket.OPEN) {
+				try { context.socket.send(event.data); } catch (e: any) {
+					console.error(`[WebSocketMachine/${context.clientId}] Error sending audio chunk:`, e);
+					context.parent.send({ type: 'WEBSOCKET.ERROR', error: `Send audio failed: ${e.message || 'Unknown'}` });
+				}
+			}
+		},
+		cleanupWebSocket: ({ context }) => {
+			console.log(`[WebSocketMachine/${context.clientId}] Cleaning up WebSocket.`);
+			if (context.socket) {
+				context.socket.onopen = null; context.socket.onmessage = null; context.socket.onerror = null; context.socket.onclose = null;
+				if (context.socket.readyState !== WebSocket.CLOSED && context.socket.readyState !== WebSocket.CLOSING) { context.socket.close(1000, 'Machine stopping'); }
+			}
+		},
+		assignSocketNull: assignWs({ socket: null }),
+		sendSilentAudioPing: ({ context }) => {
+			if (context.socket?.readyState === WebSocket.OPEN) {
 				try {
-					console.log(`[WebSocketActor/${input.parentMachineId}] Attempting to send ${event.data.byteLength} bytes of audio data. Socket state: ${socket.readyState}`);
-					socket.send(event.data);
-				}
-				catch (e: any) {
-					console.error(`[WebSocketActor/${input.parentMachineId}] Error during socket.send:`, e);
-					const message = e instanceof Error ? e.message : 'Unknown error';
-					console.error(`[WebSocketActor/${input.parentMachineId}] Error sending audio chunk:`, message, e);
-					sendBack({ type: 'WEBSOCKET.ERROR', error: `Send audio failed: ${message}` } as any);
+					// console.log(`[WebSocketMachine/${context.clientId}] Sending silent audio ping.`);
+					context.socket.send(context.silentAudioChunk.slice(0)); // Send a slice to avoid transferring ownership if needed later
+				} catch (e: any) {
+					console.error(`[WebSocketMachine/${context.clientId}] Error sending silent ping:`, e);
+					// Inform parent about send error? Maybe raise internal error?
+					// For now, just log it.
 				}
 			}
-		} else if (event.type === 'SEND_CONFIG') {
-            console.log(`[WebSocketActor/${input.parentMachineId}] Received command from parent: SEND_CONFIG`);
-			if (socket && socket.readyState === WebSocket.OPEN) {
-				try {
-                    console.log(`[WebSocketActor/${input.parentMachineId}] Sending config:`, event.payload);
-                    socket.send(JSON.stringify(event.payload));
-                }
-				catch (e: any) {
-					const message = e instanceof Error ? e.message : 'Unknown error';
-                    console.error(`[WebSocketActor/${input.parentMachineId}] Error sending config:`, message, e);
-					sendBack({ type: 'WEBSOCKET.ERROR', error: `Send config failed: ${message}` } as any);
-				}
+		},
+		startKeepaliveTimer: assignWs({
+			keepaliveIntervalId: ({ context, self }) => {
+				if (context.keepaliveIntervalId) clearInterval(context.keepaliveIntervalId);
+				console.log(`[WebSocketMachine/${context.clientId}] Starting silent audio keepalive timer (${context.keepaliveIntervalMs}ms).`);
+				return setInterval(() => { self.send({ type: 'SEND_SILENT_PING' }); }, context.keepaliveIntervalMs);
 			}
-        } else {
-            // Log other infrequent commands if needed
-            console.log(`[WebSocketActor/${input.parentMachineId}] Received other command from parent:`, event.type);
-        }
-	});
+		}),
+		clearKeepaliveTimer: assignWs({
+			keepaliveIntervalId: ({ context }) => {
+				if (context.keepaliveIntervalId) {
+					console.log(`[WebSocketMachine/${context.clientId}] Clearing keepalive timer.`);
+					clearInterval(context.keepaliveIntervalId);
+				}
+				return null;
+			}
+		}),
+	}
+}).createMachine({
+	id: 'webSocketConnection',
+	context: ({ input }) => {
+        // Create silent audio chunk (e.g., 100ms of 16kHz mono audio = 1600 samples)
+        // Each sample is Float32 (4 bytes)
+        const silentSampleCount = 1600;
+        const silentBuffer = new ArrayBuffer(silentSampleCount * 4);
+        // No need to fill with zeros, ArrayBuffer is initialized to zeros
 
-	return () => { // Cleanup
-		if (socket && socket.readyState !== WebSocket.CLOSED) {
-            console.log(`[WebSocketActor/${input.parentMachineId}] Cleaning up - closing socket.`);
-			socket.onopen = null; socket.onmessage = null; socket.onerror = null; socket.onclose = null;
-			socket.close(1000, 'Actor cleanup');
-		}
-		socket = null;
-		console.log(`[WebSocketActor/${input.parentMachineId}] Actor stopped.`);
-	};
+        return {
+            parent: input.parent,
+            url: input.url,
+            configPayload: input.configPayload,
+            clientId: input.clientId,
+            socket: null,
+            retries: 0,
+            // <<< Initialize keepalive context >>>
+            keepaliveIntervalId: null,
+            keepaliveIntervalMs: 5000, // Send silent ping every 5 seconds
+            silentAudioChunk: silentBuffer
+        };
+    },
+	initial: 'connecting',
+	states: {
+		connecting: {
+			entry: 'connectWebSocket',
+			on: {
+				'WEBSOCKET.INTERNAL.OPEN': { target: 'connected', actions: ['sendOpenToParent', 'sendConfig', 'startKeepaliveTimer'] },
+				'WEBSOCKET.INTERNAL.ERROR': { target: 'stopped', actions: ['sendErrorToParent', 'cleanupWebSocket', 'assignSocketNull', 'clearKeepaliveTimer'] },
+				'STOP': { target: 'stopped', actions: ['cleanupWebSocket', 'assignSocketNull', 'clearKeepaliveTimer'] }
+			}
+		},
+		connected: {
+			on: {
+				'WEBSOCKET.INTERNAL.MESSAGE': { actions: 'sendMessageToParent' },
+				'WEBSOCKET.INTERNAL.ERROR': { target: 'stopped', actions: ['sendErrorToParent', 'cleanupWebSocket', 'assignSocketNull', 'clearKeepaliveTimer'] },
+				'WEBSOCKET.INTERNAL.CLOSE': { target: 'stopped', actions: ['sendCloseToParent', 'cleanupWebSocket', 'assignSocketNull', 'clearKeepaliveTimer'] },
+				'SEND_AUDIO': { actions: 'sendAudioChunk' },
+				'SEND_SILENT_PING': { actions: 'sendSilentAudioPing' },
+				'STOP': { target: 'stopped', actions: ['cleanupWebSocket', 'assignSocketNull', 'clearKeepaliveTimer'] }
+			}
+		},
+		stopped: { type: 'final' }
+	}
 });
-
 
 // --- Machine Setup ---
 
@@ -271,7 +345,7 @@ export const whisperLiveSttMachine = setup({
 	actors: {
 		micPermissionActor: micPermissionActorLogic,
 		audioWorkletSetupActor: audioWorkletSetupActor,
-		websocketService: websocketActorLogic
+		websocketService: webSocketConnectionMachine // <<< Use the new machine
 	},
 	actions: {
 		// --- Context Assignments ---
@@ -315,43 +389,63 @@ export const whisperLiveSttMachine = setup({
 		// Explicit action for when worklet signals ready
 		assignWorkletReady: assign({ isWorkletReady: true }),
 
-		// WebSocket Actor Management
+		// WebSocket Actor Management - Updated
 		spawnWebSocketActor: assign({
-			websocketActor: ({ spawn, context, self }) =>
-				spawn('websocketService', {
+			websocketActor: ({ context, spawn, self }) => {
+				// Prepare initial config payload here
+				const configPayload = {
+					uid: context.clientId,
+					client_id: context.clientId, // Some servers use this name
+					language: context.language,
+					task: 'transcribe',
+					model: context.model,
+					use_vad: context.useVad,
+					...(context.useVad && {
+						vad_parameters: {
+							onset: 0.2, // Renamed from threshold, Example value, adjust as needed
+						}
+					})
+				};
+				console.log(`[WhisperLive] Spawning WebSocket machine with input:`, { url: context.wsUrl, clientId: context.clientId });
+				return spawn('websocketService', {
 					id: `ws-actor-${self.id}`,
-					input: { url: context.wsUrl, parentMachineId: self.id }
-				}),
+					input: {
+						parent: self, // Pass self as parent
+						url: context.wsUrl,
+						configPayload: configPayload, // Pass config here
+						clientId: context.clientId
+					}
+				});
+			},
+			// Update connection status based on spawning
 			connectionStatus: 'connecting',
 			isServerReady: false,
 			errorMessage: null,
 		}),
 		clearWebSocketActor: assign({ websocketActor: null }),
-		// Use stopChild for stopping the actor
-		stopWebSocketActorAction: stopChild(({ context }) => context.websocketActor!),
+		// Use stopChild for stopping the actor - send STOP event to the actor first
+		stopWebSocketActorAction: sendTo(({ context }) => context.websocketActor!, { type: 'STOP' } as WebSocketMachineEvent), // Send STOP event
 
-		// WebSocket State Updates
-		assignConnecting: assign({ connectionStatus: 'connecting', errorMessage: null }),
-		assignConnectionOpen: assign({ connectionStatus: 'connected', errorMessage: null }), // Changed from 'initializing' to 'connected'
+		// WebSocket State Updates (Now mostly based on events FROM the WebSocket machine)
+		assignConnecting: assign({ connectionStatus: 'connecting', errorMessage: null }), // Keep for initial status
+		assignConnectionOpen: assign({ connectionStatus: 'connected', errorMessage: null }), // Triggered by WEBSOCKET.OPEN
 		assignConnectionClosed: assign({
 			connectionStatus: 'disconnected',
 			isServerReady: false,
 			errorMessage: ({ event }) => {
-                // Add type check before accessing properties
-                if (event.type === 'WEBSOCKET.CLOSE' && event.code !== 1000 && event.code !== 1005 /* Normal closure */) {
+                if (event.type === 'WEBSOCKET.CLOSE' && event.code !== 1000 && event.code !== 1005) {
                     return `Connection closed unexpectedly: ${event.reason || event.code}`;
-                }
-                return null; // No error message for normal closure
+                } return null;
             },
-			websocketActor: null, // Assume actor stops on close
+			websocketActor: null, // Actor stops itself, but clear ref here too
 		}),
 		assignConnectionError: assign({
 			connectionStatus: 'error',
 			isServerReady: false,
 			errorMessage: ({ event }) => (event.type === 'WEBSOCKET.ERROR' ? event.error : 'Unknown WS error'),
-			websocketActor: null, // Assume actor stops on error
+			websocketActor: null, // Actor stops itself, clear ref
 		}),
-		assignServerReady: assign({ isServerReady: true, connectionStatus: 'connected', errorMessage: null }),
+		assignServerReady: assign({ isServerReady: true, connectionStatus: 'connected', errorMessage: null }), // Triggered by SERVER_READY message
 		assignServerWait: assign({ isServerReady: false, connectionStatus: 'waiting_server' }),
 		assignServerDisconnect: assign({ 
             isServerReady: false, 
@@ -471,36 +565,17 @@ export const whisperLiveSttMachine = setup({
 			}
 		}),
 
-
-		// --- Actor Communication ---
-		// Action to start the WebSocket connection (called internally)
-		startWebSocketActor: sendTo(({ context }) => context.websocketActor!, { type: 'START_LISTENING' } as WhisperLiveEvent),
-		// Action to send the initial configuration to the WebSocket actor
-		sendInitConfigToWebSocket: sendTo(
-			({ context }) => context.websocketActor!,
-			({ context }): WhisperLiveEvent => ({ // Use type for event creator
-				type: 'SEND_CONFIG',
-				payload: {
-					// Common config fields for whisper live servers
-					uid: context.clientId,
-					client_id: context.clientId, // Some servers use this name
-					language: context.language,
-					task: 'transcribe',
-					model: context.model,
-					use_vad: context.useVad,
-					api_token: context.apiToken // Send token if provided
-				}
-			})
-		),
-		// Action to forward audio chunks from the worklet to the WebSocket actor
+		// --- Actor Communication Updates ---
+		// REMOVE startWebSocketActor action - actor starts on spawn
+		// REMOVE sendInitConfigToWebSocket action - config passed via input
+		// UPDATE forwardAudioToWebsocket action - Send 'SEND_AUDIO' event
 		forwardAudioToWebsocket: sendTo(
 			({ context }) => context.websocketActor!,
-			({ event }): WhisperLiveEvent => {
+			({ event }): WebSocketMachineEvent | undefined => { // Use new event type
 				if (event.type === 'WORKLET_AUDIO_CHUNK') {
-                    // Forward the event as is, the actor logic will handle sending the buffer
-                    return event;
+                    return { type: 'SEND_AUDIO', data: event.data }; // Send specific event
                 }
-				return { type: 'ignore' }; // Should not happen
+				return undefined; // Use undefined for no event
 			}
 		),
 
@@ -527,52 +602,9 @@ export const whisperLiveSttMachine = setup({
 				audioWorkletNode = new AudioWorkletNode(context.audioContext, 'audio-processor');
                 console.log('[WhisperLive] setupAndStartAudioProcessing: AudioWorkletNode created.');
 
-					audioWorkletNode.port.onmessage = (ev: MessageEvent) => { // Accept any message type for now
-					    // <<< 추가: 액터/노드가 정리 중인지 확인 >>>
-					    if (!context.audioWorkletNode) {
-					        // console.log('[WhisperLive/WorkletMsg] audioWorkletNode is null in context, ignoring message.'); // 로그는 필요시 활성화
-					        return; // 노드가 null이면 (정리 중이면) 메시지 무시
-					    }
-					    // <<< ------------------------------------ >>>
-
-                    // Check message type before sending to self
-                    if (ev.data?.type === 'RMS_UPDATE') {
-                        console.log(`[WhisperLive/WorkletMsg] Received RMS_UPDATE: ${ev.data.value}`);
-                        self.send({ type: 'WORKLET_RMS_UPDATE', value: ev.data.value });
-                    } else if (ev.data?.type === 'VAD_SPEECH_START') { // Handle VAD events
-                        self.send({ type: 'VAD_SPEECH_START' });
-                    } else if (ev.data?.type === 'VAD_SILENCE_START') {
-                        self.send({ type: 'VAD_SILENCE_START' });
-                    } else if (ev.data instanceof ArrayBuffer) { // Check if data is ArrayBuffer
-					    console.log('[WhisperLive/WorkletMsg] Data is ArrayBuffer. Attempting self.send...');
-					    try {
-					        self.send({ type: 'WORKLET_AUDIO_CHUNK', data: ev.data });
-					        console.log('[WhisperLive/WorkletMsg] self.send(WORKLET_AUDIO_CHUNK) called successfully.');
-					    } catch (e) {
-					        console.error('[WhisperLive/WorkletMsg] Error during self.send(WORKLET_AUDIO_CHUNK):', e);
-					    }
-                    } else {
-                        console.warn('[WhisperLive/WorkletMsg] Unexpected message format from worklet. Expected ArrayBuffer for audio chunk. Received:', 
-                            `Type: ${typeof ev.data}`, 
-                            `Instance of ArrayBuffer: ${ev.data instanceof ArrayBuffer}`, 
-                            `Data:`, ev.data // Log the actual data
-                        );
-                    }
-				};
-                // Use onmessageerror instead of onerror for port errors
-				audioWorkletNode.port.onmessageerror = (ev) => {
-					console.error('[WhisperLive] Audio worklet port message error:', ev);
-					self.send({ type: 'WORKLET_ERROR', error: 'Audio worklet port message error' });
-				};
-                // Handle processor errors (uncaught exceptions in the worklet)
-                audioWorkletNode.onprocessorerror = (ev) => {
-                    console.error('[WhisperLive] Audio worklet processor error:', ev);
-					self.send({ type: 'WORKLET_ERROR', error: `Audio worklet processor error: ${ev}` });
-                };
-
-                console.log('[WhisperLive] setupAndStartAudioProcessing: Creating MediaStreamSourceNode...');
+				console.log('[WhisperLive] setupAndStartAudioProcessing: Creating MediaStreamSourceNode...');
 				sourceNode = context.audioContext.createMediaStreamSource(context.mediaStream);
-                console.log('[WhisperLive] setupAndStartAudioProcessing: Connecting nodes...');
+				console.log('[WhisperLive] setupAndStartAudioProcessing: Connecting nodes...');
 				sourceNode.connect(audioWorkletNode);
 				// Do NOT connect workletNode to destination unless debugging audio output
 				// audioWorkletNode.connect(context.audioContext.destination);
@@ -638,8 +670,6 @@ export const whisperLiveSttMachine = setup({
             // Stop Audio Processing
             console.log('[WhisperLive] stopAllProcessing: stopping audio processing...');
             if (context.audioWorkletNode) {
-                console.log('[WhisperLive] stopAllProcessing: Attempting to send \'stop\' message to worklet.');
-                try { context.audioWorkletNode.port.postMessage({ type: 'stop' }); } catch (e) { console.warn('Error sending stop to worklet:', e); }
                 console.log('[WhisperLive] stopAllProcessing: Attempting to close worklet port.');
                 try { context.audioWorkletNode.port.close(); } catch (e) { console.warn('Error closing worklet port:', e); }
                 console.log('[WhisperLive] stopAllProcessing: Attempting to disconnect worklet node.');
@@ -678,7 +708,6 @@ export const whisperLiveSttMachine = setup({
 
 		// --- Parent Communication ---
 		sendStateUpdateToParent: sendParent(({ context }) => {
-			console.log(`[WhisperLive/Action] Sending WORKER_STATE_UPDATE to parent. RMS: ${context.rmsLevel}`);
 			return {
 				type: 'WORKER_STATE_UPDATE',
 				state: {
@@ -776,7 +805,6 @@ export const whisperLiveSttMachine = setup({
 		assignRmsLevel: assign({
 			rmsLevel: ({ event }) => {
 				if (event.type === 'WORKLET_RMS_UPDATE') {
-					console.log(`[WhisperLive/Action] assignRmsLevel: Updating RMS to ${event.value}`);
 					return event.value;
 				}
 				return 0;
@@ -791,8 +819,8 @@ export const whisperLiveSttMachine = setup({
             audioWorkletNode: null,
             mediaStream: null,
         }),
-        // Action to check for final transcript and send internal event
-        checkAndStopWebSocketOnFinal: ({ event, self }) => {
+        // Action to check for final transcript and STOP the WebSocket actor
+        checkAndStopWebSocketOnFinal: ({ context, event, self }) => {
             if (event.type !== 'WEBSOCKET.MESSAGE') return;
             let data;
             try { data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data; } catch { return; }
@@ -801,8 +829,74 @@ export const whisperLiveSttMachine = setup({
             const isFinal = lastSegment?.final === true || lastSegment?.type === 'final' || lastSegment?.completed === true || lastSegment?.segment_type === 'final' || data?.final === true;
 
             if (isFinal) {
-                console.log('[WhisperLive] Final transcript detected in message. Sending FINAL_TRANSCRIPT_RECEIVED event.');
-                self.send({ type: 'FINAL_TRANSCRIPT_RECEIVED' });
+                console.log('[WhisperLive] Final transcript detected. Sending STOP to WebSocket actor.');
+				// Send STOP directly to the actor ref
+				if (context.websocketActor) {
+					sendTo(context.websocketActor, { type: 'STOP' } as WebSocketMachineEvent);
+				}
+				// Optional: Send internal event to transition whisperLive machine state if needed
+                // self.send({ type: 'FINAL_TRANSCRIPT_RECEIVED' });
+            }
+        },
+        // --- New Action to Setup Message Handlers (Similar to sttMachine) ---
+        setupWorkletMessageHandler: ({ context, self }) => {
+            console.log('[WhisperLive/Action] setupWorkletMessageHandler called.');
+            if (!context.audioWorkletNode) {
+                console.error('[WhisperLive/Action] Cannot setup handlers: audioWorkletNode is null in context.');
+                return;
+            }
+            context.audioWorkletNode.port.onmessage = (ev: MessageEvent) => {
+                // <<< Move checks to the very beginning >>>
+                if (context.isStopping || self.getSnapshot().status === 'done') {
+                    // Optional: Log message ignored
+                    // console.log('[WhisperLive/onmessage] Ignoring message: Actor stopping or done.');
+                    return;
+                }
+
+                // Check message type before sending to self
+                if (ev.data?.type === 'RMS_UPDATE') {
+                    try { self.send({ type: 'WORKLET_RMS_UPDATE', value: ev.data.value }); } catch(e) { /* ignore */ }
+                } else if (ev.data?.type === 'VAD_SPEECH_START') { // Handle VAD events
+                    try { self.send({ type: 'VAD_SPEECH_START' }); } catch(e) { /* ignore */ }
+                } else if (ev.data?.type === 'VAD_SILENCE_START') {
+                    try { self.send({ type: 'VAD_SILENCE_START' }); } catch(e) { /* ignore */ }
+                } else if (ev.data instanceof ArrayBuffer) { // Check if data is ArrayBuffer
+                    try {
+                        self.send({ type: 'WORKLET_AUDIO_CHUNK', data: ev.data });
+                    } catch (e) {
+                        /* ignore error if actor stopped */
+                    }
+                } else {
+                    console.warn('[WhisperLive/WorkletMsg] Unexpected message format from worklet. Expected ArrayBuffer for audio chunk. Received:',
+                        `Type: ${typeof ev.data}`,
+                        `Instance of ArrayBuffer: ${ev.data instanceof ArrayBuffer}`,
+                        `Data:`, ev.data // Log the actual data
+                    );
+                }
+            };
+            context.audioWorkletNode.port.onmessageerror = (ev) => {
+                console.error('[WhisperLive] Audio worklet port message error:', ev);
+                self.send({ type: 'WORKLET_ERROR', error: 'Audio worklet port message error' });
+            };
+            context.audioWorkletNode.onprocessorerror = (ev) => {
+                console.error('[WhisperLive] Audio worklet processor error:', ev);
+                self.send({ type: 'WORKLET_ERROR', error: `Audio worklet processor error: ${ev}` });
+            };
+            console.log('[WhisperLive/Action] Worklet message handlers assigned.');
+        },
+        // --- New Action to Mark as Stopping ---
+        markAsStopping: assign({ isStopping: true }),
+        // --- New Action to Send Stop Message to Worklet ---
+        sendStopToWorklet: ({ context }) => {
+            console.log('[WhisperLive/Action] sendStopToWorklet: Attempting to send stop to worklet.');
+            if (context.audioWorkletNode?.port) {
+                try {
+                    context.audioWorkletNode.port.postMessage({ type: 'stop' });
+                } catch (e) {
+                    console.warn('[WhisperLive/Action] sendStopToWorklet: Error sending stop message:', e);
+                }
+            } else {
+                console.warn('[WhisperLive/Action] sendStopToWorklet: No worklet node/port found.');
             }
         },
 	},
@@ -812,27 +906,11 @@ export const whisperLiveSttMachine = setup({
 			const error = specificEvent.error;
 			return error instanceof Error && (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError');
 		},
-		isWebSocketConnected: ({ context }) => context.websocketActor !== null && context.connectionStatus === 'connected',
-		canStreamAudio: ({ context }) => context.isWorkletReady && context.connectionStatus === 'connected',
-		isUnexpectedWsClose: ({ event }) => {
-            // Guard checks only the event code, not the state machine's current state
-            if (event.type !== 'WEBSOCKET.CLOSE') return false;
-			return !(event.code === 1000 || event.code === 1005);
-		},
+		canStreamAudio: ({ context }) => context.isWorkletReady,
+		canForwardAudio: ({ context }) => context.websocketActor !== null,
         canTransitionToStreaming: ({ context }) => {
             // Guard checks context properties, assumes this runs when SERVER_READY is received
             return context.isWorkletReady; // Check only worklet readiness globally? Or move handling entirely
-        },
-        canForwardAudio: ({ context }) => {
-            const isReady = context.connectionStatus === 'connected' && context.isServerReady;
-            // Re-add log for debugging
-            if (!isReady) {
-                console.log(`[WhisperLive/Guard] canForwardAudio failed: connectionStatus=${context.connectionStatus}, isServerReady=${context.isServerReady}`);
-            } else {
-                // Log success case too, temporarily
-                console.log(`[WhisperLive/Guard] canForwardAudio PASSED: connectionStatus=${context.connectionStatus}, isServerReady=${context.isServerReady}`);
-            }
-            return isReady;
         }
 	}
 }).createMachine({
@@ -858,6 +936,7 @@ export const whisperLiveSttMachine = setup({
 		errorMessage: null,
 		rmsLevel: 0,
 		isAudioProcessing: false,
+		isStopping: false, // Initialize the new flag
 	}),
 	initial: 'idle',
 
@@ -865,56 +944,86 @@ export const whisperLiveSttMachine = setup({
         '*': { actions: 'logReceivedEvent' },
 		'GLOBAL.RESET': {
 			target: '.idle',
-			actions: ['removeWorkletMessageHandler', 'stopWebSocketActorAction', 'stopAllProcessing', 'clearDynamicContext', 'sendStateUpdateToParent'] as const // Use action name
+			actions: ['markAsStopping', 'sendStopToWorklet', 'removeWorkletMessageHandler', 'stopWebSocketActorAction', 'stopAllProcessing', 'clearDynamicContext', 'sendStateUpdateToParent'] as const // Use action name
 		},
 		'xstate.error.actor.micPermissionActor': {
 			target: '.error',
 			guard: 'isPermissionDeniedError',
-			actions: ['removeWorkletMessageHandler', 'assignPermissionError', 'sendStateUpdateToParent'] as const // Add handler removal
+			actions: ['markAsStopping', 'sendStopToWorklet', 'removeWorkletMessageHandler', 'assignPermissionError', 'sendStateUpdateToParent'] as const // Add handler removal
 		},
 		'WORKLET_READY': {
 			actions: ['assignWorkletReady', 'sendStateUpdateToParent'] as const
 		},
 		'WORKLET_ERROR': {
 			target: '.error',
-			actions: ['removeWorkletMessageHandler', 'assignWorkletError', 'stopWebSocketActorAction', 'stopAllProcessing', 'clearDynamicContext', 'sendStateUpdateToParent'] as const // Use action name
+			actions: ['markAsStopping', 'sendStopToWorklet', 'removeWorkletMessageHandler', 'assignWorkletError', 'stopWebSocketActorAction', 'stopAllProcessing', 'clearDynamicContext', 'sendStateUpdateToParent'] as const // Use action name
 		},
 		'WEBSOCKET.OPEN': {
 			actions: [
-			    log('[WhisperLive] WEBSOCKET.OPEN event received.'),
-			    assign({ connectionStatus: 'connected' as const, errorMessage: null }), // Assign directly
-			    log(({ context }) => `[WhisperLive] After assignConnectionOpen: status=${context.connectionStatus}`), // Log status after assignment
-			    'sendInitConfigToWebSocket',
+			    log('[WhisperLive] WEBSOCKET.OPEN received from child actor.'),
+			    'assignConnectionOpen', // Update local status for UI
+			    // Config is sent by child actor on open now
 			    'sendStateUpdateToParent'
-			] as const // Ensure the array is treated as a tuple
-		},
-		'WEBSOCKET.CLOSE': [
-			{ actions: log('[WhisperLive/GlobalOn] WARNING: WEBSOCKET.CLOSE triggered.') },
-			{
-				target: '.error',
-				guard: 'isUnexpectedWsClose',
-				actions: ['removeWorkletMessageHandler', 'assignConnectionClosed', 'stopAudioProcessing', 'clearAudioNodesAction', 'sendStateUpdateToParent'] as const // Add handler removal
-			}
-		],
-		'WEBSOCKET.ERROR': [
-			{ actions: log('[WhisperLive/GlobalOn] WARNING: WEBSOCKET.ERROR triggered.') },
-			{
-				target: '.error',
-				actions: ['removeWorkletMessageHandler', 'assignConnectionError', 'stopAudioProcessing', 'clearAudioNodesAction', 'sendStateUpdateToParent'] as const // Add handler removal
-			}
-		],
-		'WEBSOCKET.MESSAGE': {
-            actions: ['processWebSocketMessage', 'assignTranscriptionUpdate', 'sendStateUpdateToParent', 'sendFinalizedUpdateToParent', 'checkAndStopWebSocketOnFinal'] as const
-		},
-		'WORKLET_AUDIO_CHUNK': {
-			actions: [
-			    log('[WhisperLive/GlobalOn] TEMP: Received WORKLET_AUDIO_CHUNK globally. (Guard and forward removed)')
 			] as const
 		},
+		'WEBSOCKET.CLOSE': [
+			{
+				// Handler for unexpected close (excluding 1000, 1005, 1011)
+				guard: ({ event }) => {
+					// <<< Type assertion >>>
+					const closeEvent = event as Extract<WhisperLiveEvent, { type: 'WEBSOCKET.CLOSE' }>;
+					return !(closeEvent.code === 1000 || closeEvent.code === 1005 || closeEvent.code === 1011);
+				},
+				target: '.error',
+				actions: [
+					log('[WhisperLive] WEBSOCKET.CLOSE received from child actor (unexpected). Transitioning to error.'),
+					'assignConnectionClosed',
+					'markAsStopping',
+					'sendStopToWorklet',
+					'removeWorkletMessageHandler',
+					'stopAudioProcessing',
+					'clearAudioNodesAction',
+					'sendStateUpdateToParent'
+				] as const
+			},
+			{
+				// Handler for expected close (1000, 1005, 1011)
+				guard: ({ event }) => {
+					// <<< Type assertion >>>
+					const closeEvent = event as Extract<WhisperLiveEvent, { type: 'WEBSOCKET.CLOSE' }>;
+					return closeEvent.code === 1000 || closeEvent.code === 1005 || closeEvent.code === 1011;
+				},
+				target: '.stopping',
+				actions: [
+					log(({ event }) => `[WhisperLive] WEBSOCKET.CLOSE received from child actor (expected code: ${(event as any).code}). Transitioning to stopping.`),
+					'assignConnectionClosed'
+				] as const
+			}
+		],
+		'WEBSOCKET.ERROR': {
+			target: '.error',
+			actions: [
+				log('[WhisperLive] WEBSOCKET.ERROR received from child actor.'),
+				'assignConnectionError',
+				'markAsStopping', // Ensure cleanup flags are set
+				'sendStopToWorklet',
+				'removeWorkletMessageHandler',
+				'stopAudioProcessing',
+				'clearAudioNodesAction',
+				'sendStateUpdateToParent'
+			] as const
+		},
+		'WEBSOCKET.MESSAGE': {
+            // Process message first, then update transcripts, then check for final
+			actions: ['processWebSocketMessage', 'assignTranscriptionUpdate', 'sendStateUpdateToParent', 'sendFinalizedUpdateToParent', 'checkAndStopWebSocketOnFinal'] as const
+		},
+		'WORKLET_AUDIO_CHUNK': { // Forward audio if possible
+			guard: ({ context }) => !context.isStopping && context.websocketActor !== null,
+			actions: ['forwardAudioToWebsocket']
+		},
         'SERVER_READY': {
-            target: '.streamingAudio',
-            guard: 'canTransitionToStreaming', // Check if worklet ready (WS should be open by now ideally)
-            actions: ['assignServerReady', 'sendStateUpdateToParent'] as const
+            // Maybe transition state or just update context
+			actions: ['assignServerReady', 'sendStateUpdateToParent', log('[WhisperLive] SERVER_READY processed.')] as const
         },
         'SERVER_WAIT': {
             actions: ['assignServerWait', 'sendStateUpdateToParent', log('[WhisperLive] Received SERVER_WAIT from server.')] as const
@@ -923,7 +1032,7 @@ export const whisperLiveSttMachine = setup({
 			{ actions: log('[WhisperLive/GlobalOn] WARNING: SERVER_DISCONNECT triggered.') },
 			{
 				target: '.error',
-				actions: ['removeWorkletMessageHandler', 'assignServerDisconnect', 'stopWebSocketActorAction', 'stopAudioProcessing', 'clearAudioNodesAction', 'sendStateUpdateToParent'] as const // Add handler removal
+				actions: ['markAsStopping', 'sendStopToWorklet', 'removeWorkletMessageHandler', 'assignServerDisconnect', 'stopWebSocketActorAction', 'stopAudioProcessing', 'clearAudioNodesAction', 'sendStateUpdateToParent'] as const // Add handler removal
 			}
 		],
         'LANGUAGE_DETECTED': {
@@ -938,7 +1047,7 @@ export const whisperLiveSttMachine = setup({
 		idle: {
 			entry: [log('[WhisperLive] Entering idle state.'), 'clearDynamicContext', 'assignClientId', 'sendStateUpdateToParent'] as const,
 			on: {
-				START_LISTENING: { target: 'initializingAudio' }
+				START_LISTENING: 'initializingAudio'
 			}
 		},
 		initializingAudio: {
@@ -951,7 +1060,9 @@ export const whisperLiveSttMachine = setup({
                      actions: [
                          log('[WhisperLive/AudioInit] audioWorkletSetupActor succeeded. Running assignAudioContextAndWorkletReady...'),
                          'assignAudioContextAndWorkletReady',
-                         log(({ context }) => `[WhisperLive/AudioInit] After assignAudioContextAndWorkletReady: isWorkletReady=${context.isWorkletReady}`)
+                         log(({ context }) => `[WhisperLive/AudioInit] After assignAudioContextAndWorkletReady: isWorkletReady=${context.isWorkletReady}`),
+                         'setupWorkletMessageHandler',
+                         'spawnWebSocketActor'
                      ] as const
 				 },
                  onError: {
@@ -975,8 +1086,8 @@ export const whisperLiveSttMachine = setup({
                            log('[WhisperLive/Perms] micPermissionActor succeeded.'),
                            'assignStream',
                            'setupAndStartAudioProcessing',
-						    'spawnWebSocketActor',      // Spawn WS actor here
-						    'startWebSocketActor'       // Start WS actor here
+                           'setupWorkletMessageHandler',
+                           'spawnWebSocketActor'
                        ] as const
 				 },
                  onError: {
@@ -986,81 +1097,54 @@ export const whisperLiveSttMachine = setup({
 			 }
 		},
 		waitingForSpeech: {
-			 entry: [log('[WhisperLive] Entering waitingForSpeech state (WS disconnected). Listening for VAD...'), 'sendStateUpdateToParent'],
-			 always: { // Ensure audio processing is running
-				 guard: ({ context }) => !context.isAudioProcessing,
-				 target: 'initializingAudio',
-				 actions: log('[WhisperLive] Audio processing not active in waitingForSpeech, re-initializing.')
-			 },
-			 on: {
-				 VAD_SPEECH_START: { // Reconnect on next speech start
-				     target: 'connectingWebSocket',
-				     actions: [log('[WhisperLive] VAD_SPEECH_START received in waiting state, reconnecting WebSocket...')] as const // Ensure actions is an array
-				 },
-				 STOP_LISTENING: { target: 'stopping', actions: ['removeWorkletMessageHandler'] as const }, // Add handler removal
-				 // WORKLET_ERROR handled globally
-			 }
+			entry: [log('[WhisperLive] Entering waitingForSpeech state (WS may be stopped).'), 'sendStateUpdateToParent'],
+			on: {
+				VAD_SPEECH_START: {
+					actions: [
+						log('[WhisperLive] VAD_SPEECH_START in waiting. Re-spawning WebSocket actor...'),
+						'stopWebSocketActorAction',
+						'spawnWebSocketActor'
+					],
+					target: 'connectingWebSocket'
+				},
+				STOP_LISTENING: { target: 'stopping' },
+			}
 		},
 		connectingWebSocket: {
-			 entry: [
-			    log('[WhisperLive] Entering connectingWebSocket state.'),
-			    // Spawn/Start actions are now handled in the transition from requestingPermission
-			    // or from waitingForSpeech (if reconnecting)
-			    'sendStateUpdateToParent' // Keep sending state update
-			] as const,
+			entry: [log('[WhisperLive] Entering connectingWebSocket state (Waiting for WEBSOCKET.OPEN from child)...'), 'sendStateUpdateToParent'] as const,
 			 on: {
-				 // VAD_SILENCE_START no longer disconnects WS
 				 STOP_LISTENING: { target: 'stopping' },
-				 // Server ready transitions to streamingAudio
 				 'SERVER_READY': {
-				     target: 'streamingAudio',
-				     guard: 'canTransitionToStreaming', // Check if worklet ready (WS should be open by now ideally)
-				     actions: ['assignServerReady', 'sendStateUpdateToParent'] as const
+					 actions: ['assignServerReady', 'sendStateUpdateToParent'] as const,
+					 target: 'streamingAudio'
 				 },
-				 // WS events handled globally but specific error/close might need review
 			 },
-			 exit: log('[WhisperLive] Exiting connectingWebSocket state (likely transitioning to streamingAudio).')
+			 exit: log('[WhisperLive] Exiting connectingWebSocket state.')
 		},
 		streamingAudio: {
-			 entry: [log('[WhisperLive] Entering streamingAudio state.'), 'logAudioStreamingStarted', 'sendStateUpdateToParent'] as const,
-			 exit: [log('[WhisperLive] Exiting streamingAudio state.'), 'sendStateUpdateToParent'],
+			 entry: [log('[WhisperLive] Entering streamingAudio state (WS connected, Server Ready).'), 'sendStateUpdateToParent'] as const,
+			 exit: [log('[WhisperLive] Exiting streamingAudio state.')],
 			 on: {
-				 // VAD_SILENCE_START no longer disconnects WS
-				 // Consider adding logic here or in worklet to *pause* sending audio on silence if desired
-				 STOP_LISTENING: { target: 'stopping', actions: ['removeWorkletMessageHandler'] as const }, // Add handler removal
+				 STOP_LISTENING: { target: 'stopping' },
 				 'WEBSOCKET.MESSAGE': {
 				     actions: [
 				         'processWebSocketMessage',
 				         'assignTranscriptionUpdate',
 				         'sendStateUpdateToParent',
-				         'sendFinalizedUpdateToParent', // Might still be useful
-				         'checkAndStopWebSocketOnFinal' // New action to trigger stop
+				         'sendFinalizedUpdateToParent',
+				         'checkAndStopWebSocketOnFinal'
 				     ] as const
 				 },
-				 'FINAL_TRANSCRIPT_RECEIVED': { // Internal event
-				     target: 'stoppingWebSocket',
-				     actions: log('[WhisperLive] Received FINAL_TRANSCRIPT_RECEIVED. Stopping WebSocket.')
-				 },
-				 // Global handlers for CLOSE/ERROR still apply
 			 }
-		},
-		stoppingWebSocket: { // State to only stop the websocket
-			entry: [
-			    log('[WhisperLive] Entering stoppingWebSocket state.'),
-			    'stopWebSocketActorAction',
-			    'clearWebSocketActor',
-			    assign({ connectionStatus: 'disconnected' as const, isServerReady: false }),
-			    'sendStateUpdateToParent'
-			] as const,
-			// After stopping WS, go back to waiting for speech
-			always: { target: 'waitingForSpeech' }
 		},
 		stopping: {
 			 entry: [
-				 'removeWorkletMessageHandler', // Remove handlers first
 				 log('[WhisperLive] Entering stopping state (STOP_LISTENING received).'),
+				 'markAsStopping',
+				 'sendStopToWorklet',
+				 'removeWorkletMessageHandler',
 				 'stopWebSocketActorAction',
-				 'stopAllProcessing', // Calls actions defined in setup, includes detailed logging
+				 'stopAllProcessing',
 				 'clearDynamicContext',
 				 'sendStateUpdateToParent'
 			 ] as const,
@@ -1068,13 +1152,15 @@ export const whisperLiveSttMachine = setup({
 		},
 		error: {
 			entry: [
-				 'removeWorkletMessageHandler', // Remove handlers first
-				 'logError',
-				 'sendErrorToParent',
-				 'stopWebSocketActorAction',
-				 'stopAllProcessing', // Calls actions defined in setup, includes detailed logging
-				 'clearDynamicContext'
-			 ] as const,
+				'markAsStopping',
+				'sendStopToWorklet',
+				'removeWorkletMessageHandler',
+				'logError',
+				'sendErrorToParent',
+				'stopWebSocketActorAction',
+				'stopAllProcessing',
+				'clearDynamicContext'
+			] as const,
 			on: {
 				START_LISTENING: { target: 'initializingAudio' },
 			}
