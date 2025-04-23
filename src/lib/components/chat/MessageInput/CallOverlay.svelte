@@ -81,8 +81,7 @@
 	const { snapshot: callSnapshot, send: sendCall } = useMachine(callMachine);
 
 	// Determine initial STT engine based on browser
-	let initialSttEngine: SttEngine = 'whisper';
-	/* // Remove or comment out browser detection for testing Whisper as default
+	let initialSttEngine: SttEngine = 'whisper-live';
 	if (
 		typeof navigator !== 'undefined' &&
 		navigator.userAgent.includes('Chrome') &&
@@ -91,7 +90,6 @@
 		console.log('[CallOverlay] Chrome detected, setting default STT engine to web.');
 		initialSttEngine = 'web';
 	}
-	*/
 
 	// STT Configurator Machine (Master)
 	const { snapshot: sttConfiguratorSnapshot, send: sendSttConfigurator } = useMachine(sttConfiguratorMachine, {
