@@ -292,10 +292,8 @@ const webSocketConnectionMachine = setup({
 	id: 'webSocketConnection',
 	context: ({ input }) => {
         // Create silent audio chunk (e.g., 100ms of 16kHz mono audio = 1600 samples)
-        // Each sample is Float32 (4 bytes)
         const silentSampleCount = 1600;
         const silentBuffer = new ArrayBuffer(silentSampleCount * 4);
-        // No need to fill with zeros, ArrayBuffer is initialized to zeros
 
         return {
             parent: input.parent,
@@ -306,7 +304,7 @@ const webSocketConnectionMachine = setup({
             retries: 0,
             // <<< Initialize keepalive context >>>
             keepaliveIntervalId: null,
-            keepaliveIntervalMs: 2000, // <<< Reduce interval to 2 seconds >>>
+            keepaliveIntervalMs: 2000, // Keep interval at 2 seconds
             silentAudioChunk: silentBuffer
         };
     },
@@ -402,7 +400,7 @@ export const whisperLiveSttMachine = setup({
 					use_vad: context.useVad,
 					...(context.useVad && {
 						vad_parameters: {
-							onset: 0.1, // Renamed from threshold, Example value, adjust as needed
+							onset: 0.7, // <<< Increase onset threshold slightly >>>
 						}
 					})
 				};
@@ -971,16 +969,22 @@ export const whisperLiveSttMachine = setup({
 				] as const
 			},
 			{
-				// Handler for expected close (1000, 1005, 1011)
+				// <<< Handler for expected closes (1000, 1005, 1011) - NOW RECONNECTS >>>
 				guard: ({ event }) => {
 					const closeEvent = event as Extract<WhisperLiveEvent, { type: 'WEBSOCKET.CLOSE' }>;
 					return closeEvent.code === 1000 || closeEvent.code === 1005 || closeEvent.code === 1011;
 				},
-				target: '.stopping',
+				target: '.connectingWebSocket', // <<< Change target to reconnect >>>
 				actions: [
-					log(({ event }) => `[WhisperLive] WEBSOCKET.CLOSE received from child actor (expected code: ${(event as any).code}). Transitioning to stopping.`),
-					'assignConnectionClosed'
-				] as const
+					log(({ event }) => `[WhisperLive] WEBSOCKET.CLOSE received (code: ${(event as any).code}). Reconnecting...`),
+					'assignConnectionClosed', // Briefly mark as disconnected
+					// --- Cleanup before restarting WS ---
+					// 'stopWebSocketActorAction', // Actor is already closing/closed, sending STOP likely unnecessary/error prone
+					'clearWebSocketActor',        // Clear the actor ref in context
+					'clearTranscriptionBuffers',  // Clear transcript parts for the new session
+					// --- Restart WS ---
+					'spawnWebSocketActor'         // Spawn a new actor and set status to connecting
+				] // No 'as const' needed
 			}
 		],
 		'WEBSOCKET.ERROR': {

@@ -152,7 +152,18 @@ class AudioProcessor extends AudioWorkletProcessor {
     // --- Audio Chunk Resampling and Sending --- 
     const resampledData = resample(inputData, sampleRate, this._targetSampleRate);
     if (this._isRecording) { // Send audio whenever recording, regardless of VAD state
-      this.port.postMessage(resampledData.buffer, [resampledData.buffer]);
+        // <<< Modify sending logic based on VAD state >>>
+        if (this._isSpeaking) {
+            // Send actual resampled audio when speaking
+            // console.log(`[AudioWorklet] Sending actual audio chunk (Size: ${resampledData.buffer.byteLength})`); // Optional log
+            this.port.postMessage(resampledData.buffer, [resampledData.buffer]);
+        } else {
+            // Send silent chunk when not speaking (VAD detected silence)
+            // Create a buffer of zeros with the same length as the resampled data
+            const silentBuffer = new ArrayBuffer(resampledData.buffer.byteLength);
+            // console.log(`[AudioWorklet] Sending SILENT chunk (Size: ${silentBuffer.byteLength})`); // Optional log
+            this.port.postMessage(silentBuffer, [silentBuffer]);
+        }
     }
 
     // Always return true to keep the processor node alive until explicitly terminated
