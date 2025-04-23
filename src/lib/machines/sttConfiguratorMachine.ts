@@ -157,17 +157,12 @@ export const sttConfiguratorMachine = setup({
 			}
 		}),
 		stopActor: assign({ // Renamed from stopManager
-			managerRef: ({ context }) => {
-				if (context.managerRef) {
-					console.log(`[Configurator] Stopping actor: ${context.managerRef.id}`);
-					stopChild(context.managerRef);
-				}
-				return null;
-			},
+			managerRef: null, // Clear the reference
 			workerIsListening: false,
 			workerError: null,
 			workerCurrentTranscript: null,
-			workerFinalTranscript: null
+			workerFinalTranscript: null,
+			workerRmsLevel: 0
 		}),
 		// Start the spawned worker/manager
 		startWorker: sendTo(
@@ -239,19 +234,10 @@ export const sttConfiguratorMachine = setup({
 				return context.workerCurrentTranscript;
 			},
 			workerFinalTranscript: ({ context, event }) => {
-				// Handle state update from worker
-				if (event.type === 'WORKER_STATE_UPDATE') {
-					// Worker now sends null or string for finalTranscript
-					const finalTranscript = event.state?.finalTranscript;
-					// Assign if it's a string or null, otherwise keep existing
-					if (typeof finalTranscript === 'string' || finalTranscript === null) {
-						return finalTranscript;
-					}
-				}
-				// Handle direct update event (e.g., from Whisper Manager/Live)
+				// Only update from MANAGER_TRANSCRIPTION_UPDATE
 				if (event.type === 'MANAGER_TRANSCRIPTION_UPDATE') {
-					// Directly assign the value (can be string or null)
-					return event.finalTranscript;
+					console.log(`[Configurator/AssignState] Updating finalTranscript from MANAGER_TRANSCRIPTION_UPDATE: ${event.finalTranscript}`);
+					return event.finalTranscript; // Can be string or null
 				}
 				// Keep existing value if no relevant update
 				return context.workerFinalTranscript;
@@ -307,6 +293,10 @@ export const sttConfiguratorMachine = setup({
 		),
 		// Action to explicitly set listening state
 		setListening: assign({ workerIsListening: ({ event }, params: { value: boolean }) => params.value }),
+		sendStopToChild: sendTo( // <<< New action >>>
+			({ context }) => context.managerRef,
+			{ type: 'STOP_LISTENING' } // Use the event the child expects for stopping
+		),
 	},
 	guards: {
 		hasActorRef: ({ context }) => context.managerRef !== null, // Renamed from hasManagerRef
@@ -347,7 +337,13 @@ export const sttConfiguratorMachine = setup({
 				'sendStartCommandToActor', // Send the appropriate start command based on engine
 				{ type: 'setListening', params: { value: true } } // Assume listening starts
 			] as const,
-			exit: ['stopActor', { type: 'setListening', params: { value: false } }, log('[Configurator] Exiting active state, stopping actor.')] as const,
+			exit: [
+				log('[Configurator] Exiting active state, sending STOP_LISTENING to child...'),
+				'sendStopToChild', // Send stop event first
+				log('[Configurator] Cleaning up context...'), // Log context cleanup
+				'stopActor', // Clean up context
+				{ type: 'setListening', params: { value: false } }
+			] as const,
 			on: {
 				STOP_SESSION: { target: 'idle' },
 				CONFIG_UPDATE: {
