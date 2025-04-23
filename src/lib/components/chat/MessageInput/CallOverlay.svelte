@@ -81,7 +81,7 @@
 	const { snapshot: callSnapshot, send: sendCall } = useMachine(callMachine);
 
 	// Determine initial STT engine based on browser
-	let initialSttEngine: SttEngine = 'whisper-live';
+	let initialSttEngine: SttEngine = 'whisper';
 	/* // Remove or comment out browser detection for testing Whisper as default
 	if (
 		typeof navigator !== 'undefined' &&
@@ -509,12 +509,20 @@
 	onDestroy(() => {
 		console.log('CallOverlay unmounting - cleanup initiated');
 
-		// Stop STT Session via Configurator
-		sendSttConfigurator({ type: 'STOP_SESSION' });
+		// Stop STT Session via Configurator (check status first)
+		if ($sttConfiguratorSnapshot?.status !== 'done') {
+			sendSttConfigurator({ type: 'STOP_SESSION' });
+		} else {
+			console.log('[CallOverlay/onDestroy] STT Configurator already stopped, skipping STOP_SESSION.');
+		}
 
-		// Stop TTS (remains the same)
-		sendTts({ type: 'INTERRUPT' });
-		sendTts({ type: 'RESET' });
+		// Stop TTS (check status first)
+		if ($ttsSnapshot?.status !== 'done') {
+			sendTts({ type: 'INTERRUPT' });
+			sendTts({ type: 'RESET' });
+		} else {
+			console.log('[CallOverlay/onDestroy] TTS Machine already stopped, skipping INTERRUPT/RESET.');
+		}
 
 		// Stop camera (remains the same)
 		stopCamera();
@@ -530,8 +538,12 @@
 			wakeLock = null;
 		}
 
-		// Reset chat machine (remains the same)
-		sendChat({ type: 'RESET' });
+		// Reset chat machine (check status first)
+		if ($chatSnapshot?.status !== 'done') {
+			sendChat({ type: 'RESET' });
+		} else {
+			console.log('[CallOverlay/onDestroy] Chat Machine already stopped, skipping RESET.');
+		}
 	});
 
 </script>

@@ -309,9 +309,24 @@ export const sttConfiguratorMachine = setup({
 		),
 		// Action to explicitly set listening state
 		setListening: assign({ workerIsListening: ({ event }, params: { value: boolean }) => params.value }),
-		sendStopToChild: sendTo( // <<< New action >>>
-			({ context }) => context.managerRef,
-			{ type: 'STOP_LISTENING' } // Use the event the child expects for stopping
+		sendAppropriateStopCommand: sendTo(
+			({ context }) => context.managerRef!,
+			({ context }) => {
+				if (!context.managerRef) return undefined;
+				const targetActorId = context.managerRef.id;
+				console.log(`[Configurator] Sending appropriate stop command to ${targetActorId} for engine ${context.sttEngineSetting}`);
+				switch (context.sttEngineSetting) {
+					case 'whisper':
+						return { type: 'STOP_CALL' };
+					case 'web':
+						return { type: 'STOP' };
+					case 'whisper-live':
+						return { type: 'STOP_LISTENING' };
+					default:
+						console.warn(`[Configurator] No specific stop command for engine: ${context.sttEngineSetting}`);
+						return undefined; // Or send a generic STOP?
+				}
+			}
 		),
 	},
 	guards: {
@@ -353,15 +368,24 @@ export const sttConfiguratorMachine = setup({
 				'sendStartCommandToActor', // Send the appropriate start command based on engine
 				{ type: 'setListening', params: { value: true } } // Assume listening starts
 			] as const,
-			exit: [
-				log('[Configurator] Exiting active state, sending STOP_LISTENING to child...'),
-				'sendStopToChild', // Send stop event first
-				log('[Configurator] Cleaning up context...'), // Log context cleanup
-				'stopActor', // Clean up context
-				{ type: 'setListening', params: { value: false } }
-			] as const,
 			on: {
-				STOP_SESSION: { target: 'idle' },
+				STOP_SESSION: { 
+					target: 'idle', 
+					actions: [
+						log('[Configurator] STOP_SESSION received. Cleaning up...'),
+						'sendAppropriateStopCommand', // Send graceful stop command
+						stopChild(({ context }) => context.managerRef), // Stop the actor instance
+						assign({ // Clear context after stopping child
+							managerRef: null,
+							workerIsListening: false,
+							workerError: null,
+							workerCurrentTranscript: null,
+							workerFinalTranscript: null,
+							workerRmsLevel: 0
+						}),
+						{ type: 'setListening', params: { value: false } }
+					]
+				 },
 				CONFIG_UPDATE: {
 					target: 'active', // Re-enter to potentially respawn with new config
 					actions: ['assignConfig']

@@ -39,6 +39,7 @@ export type SttEvent =
     // Commands/Info from Manager
     | { type: 'PROCESS_CHUNKS' } // Sent by manager
     | { type: 'STOP' } // Sent by manager
+    | { type: 'CLEANUP' } // <<< Added: Explicit cleanup event from manager
     // Internal Events: Initialization
     | { type: 'INITIALIZATION_COMPLETE'; recorder: MediaRecorder } // Kept for recorder
     | { type: 'INITIALIZATION_FAILED'; error: string } // Kept for recorder error
@@ -211,7 +212,12 @@ export const sttMachine = setup({
              if (context.mediaRecorder) {
                  console.log('[sttWorker] Setting up MediaRecorder listeners...');
                  context.mediaRecorder.ondataavailable = (event) => {
+                     if (context.isStopping) {
+                         // console.log('[sttWorker/ondataavailable] Ignoring data: isStopping flag is true.');
+                         return;
+                     }
                      if (event.data.size > 0) {
+                         if (self.getSnapshot()?.status === 'done') return;
                          self.send({ type: 'RECORDING_DATA_AVAILABLE', data: event.data });
                      }
                  };
@@ -425,17 +431,18 @@ export const sttMachine = setup({
                 // --- Throttled logging --- 
                 const now = Date.now();
 
-                // <<< Check if actor is stopping or stopped >>>
+                // <<< Check if actor is stopping >>>
                 if (context.isStopping) {
                     // Optional: Log that the message is being ignored due to stopping flag.
                     // console.log('[sttWorker/onmessage] Ignoring message: isStopping flag is true.');
-                    return;
+                    return; // Simplified check
                 }
-                if (self.getSnapshot().status === 'done') {
-                    // Optional: Log that the message is being ignored.
-                    // console.log('[sttWorker/onmessage] Ignoring message: Actor is stopped.');
-                    return;
-                }
+                // Remove the snapshot check as isStopping should be sufficient - Reverted, adding back final checks
+                // if (self.getSnapshot().status === 'done') {
+                //     // Optional: Log that the message is being ignored.
+                //     // console.log('[sttWorker/onmessage] Ignoring message: Actor is stopped.');
+                //     return;
+                // }
 
                 if (now - lastLogTime > 1000) { // Log max once per second
                     lastLogTime = now;
@@ -445,13 +452,22 @@ export const sttMachine = setup({
                 // Handle messages from worklet and send as machine events
                 if (ev.data?.type === 'RMS_UPDATE') {
                     if (now - lastLogTime === 0) console.log('[sttWorker/onmessage] Handling RMS_UPDATE (throttled)...'); // Log details only when throttled log is printed
-                    try { self.send({ type: 'WORKLET_RMS_UPDATE', value: ev.data.value }); } catch (e) { /* ignore error if actor stopped */ }
+                    try {
+                         if (self.getSnapshot()?.status === 'done') return; // <-- Check added
+                        self.send({ type: 'WORKLET_RMS_UPDATE', value: ev.data.value });
+                    } catch (e) { /* ignore error if actor stopped */ }
                 } else if (ev.data?.type === 'VAD_SPEECH_START') {
                     if (now - lastLogTime === 0) console.log('[sttWorker/onmessage] Handling VAD_SPEECH_START (throttled)...'); // Log details only when throttled log is printed
-                    try { self.send({ type: 'VAD_SPEECH_START' }); } catch (e) { /* ignore error if actor stopped */ }
+                    try {
+                         if (self.getSnapshot()?.status === 'done') return; // <-- Check added
+                        self.send({ type: 'VAD_SPEECH_START' });
+                    } catch (e) { /* ignore error if actor stopped */ }
                 } else if (ev.data?.type === 'VAD_SILENCE_START') {
                     if (now - lastLogTime === 0) console.log('[sttWorker/onmessage] Handling VAD_SILENCE_START (throttled)...'); // Log details only when throttled log is printed
-                    try { self.send({ type: 'VAD_SILENCE_START' }); } catch (e) { /* ignore error if actor stopped */ }
+                    try {
+                         if (self.getSnapshot()?.status === 'done') return; // <-- Check added
+                        self.send({ type: 'VAD_SILENCE_START' });
+                    } catch (e) { /* ignore error if actor stopped */ }
                 }
                 // Ignore ArrayBuffer chunks silently
                 else if (!(ev.data instanceof ArrayBuffer)) {
@@ -470,27 +486,38 @@ export const sttMachine = setup({
         },
         // --- New Action to Remove Listeners ---
         removeWorkletListeners: ({ context }) => {
-            console.log('[sttWorker/Action] Removing worklet message listeners...');
+            console.log('[sttWorker/Action] Removing worklet message listeners and closing port...'); // Log updated
             if (context.audioWorkletNode?.port) {
                 try {
-                    // 1. Send stop message to worklet first
-                    console.log('[sttWorker/Action] Sending stop message to worklet before removing listeners.');
-                    context.audioWorkletNode.port.postMessage({ type: 'stop' });
-                } catch (e) {
-                    console.warn('[sttWorker/Action] Error sending stop message to worklet:', e);
-                    // Continue even if sending stop fails, try to remove listeners anyway
-                }
-                try {
-                    // Set handlers to null to stop processing messages
+                    // Set handlers to null FIRST to stop processing messages immediately
                     context.audioWorkletNode.port.onmessage = null;
                     context.audioWorkletNode.port.onmessageerror = null;
                     console.log('[sttWorker/Action] Worklet message listeners removed.');
+
+                    // Send stop message to worklet AFTER removing listeners
+                    try {
+                        console.log('[sttWorker/Action] Sending stop message to worklet.');
+                        context.audioWorkletNode.port.postMessage({ type: 'stop' });
+                    } catch (e) {
+                        console.warn('[sttWorker/Action] Error sending stop message to worklet:', e);
+                        // Continue even if sending stop fails, try to close port anyway
+                    }
+
+                    // Close the port AFTER removing listeners and sending stop
+                    try {
+                        console.log('[sttWorker/Action] Closing worklet port...');
+                        context.audioWorkletNode.port.close();
+                        console.log('[sttWorker/Action] Worklet port closed.');
+                    } catch (closeError) {
+                         console.warn('[sttWorker/Action] Error closing worklet port:', closeError);
+                         // Continue cleanup even if closing fails
+                    }
                 } catch (e) {
                     // Log error but continue, as cleanup should proceed
-                    console.warn('[sttWorker/Action] Error removing worklet listeners:', e);
+                    console.warn('[sttWorker/Action] Error during worklet listener removal/stop/close:', e);
                 }
             } else {
-                console.log('[sttWorker/Action] No audioWorkletNode or port found, skipping listener removal.');
+                console.log('[sttWorker/Action] No audioWorkletNode or port found, skipping listener removal/port close.');
             }
         },
         // --- New Action to Mark as Stopping ---
@@ -534,18 +561,29 @@ export const sttMachine = setup({
                 onDone: {
                     target: 'initializingWorklet',
                     actions: [
-                        'assignRecorder', // Use string action name
-                        'setupRecorderListeners', // Use string action name
+                        'assignRecorder',
+                        'setupRecorderListeners',
                         log('[sttWorker] Recorder initialized, moving to init worklet.')
                     ]
                 },
                 onError: {
                     target: 'stopped',
-                    actions: ['assignError', 'sendErrorToParent', log('[sttWorker] Recorder initialization failed.')]
+                    // Cleanup actions removed, handled by CLEANUP or final state entry
+                    actions: ['markAsStopping', 'assignError', 'sendErrorToParent', log('[sttWorker] Recorder initialization failed.')]
                 }
             },
             on: {
-                STOP: { target: 'stopped', actions: log('[sttWorker] Received STOP during recorder initialization.') }
+                STOP: { actions: [log('[sttWorker] Received STOP during recorder initialization (ignored, waiting for CLEANUP).')] }, // Cleanup removed
+                CLEANUP: { // <<< Added CLEANUP handler
+                    target: 'stopped',
+                    actions: [
+                        log('[sttWorker] Received CLEANUP during recorder initialization.'),
+                        'markAsStopping',
+                        'removeWorkletListeners', // Safe
+                        'stopAudioProcessing', // Safe
+                        'stopRecorder' // Safe
+                    ]
+                }
             }
         },
         initializingWorklet: {
@@ -557,16 +595,17 @@ export const sttMachine = setup({
                     target: 'listening',
                     guard: 'isWorkletSetupSuccess',
                     actions: [
-                        'assignAudioContextAndWorkletReady', // 1. Assign context and ready flag
-                        'setupAndStartAudioProcessing',     // 2. Create nodes, connect, start worklet, assign node to context
-                        'setupWorkletMessageHandler',       // 3. Assign message handlers to the node in context
+                        'assignAudioContextAndWorkletReady',
+                        'setupAndStartAudioProcessing',
+                        'setupWorkletMessageHandler',
                         log('[sttWorker] AudioWorklet setup success, moving to listening.')
                     ]
                 },
                 onError: {
                     target: 'stopped',
                     actions: [
-                        'markAsStopping',
+                        'markAsStopping', // Keep markAsStopping for immediate effect
+                        // removeWorkletListeners removed
                         log('[sttWorker/InvokeError] !!! onError in initializingWorklet (audioWorkletSetupActor) !!!'),
                         'assignWorkletError',
                         'sendErrorToParent'
@@ -574,7 +613,17 @@ export const sttMachine = setup({
                 }
             },
             on: {
-                STOP: { target: 'stopped', actions: ['closeAudioContext', 'clearAudioNodes', log('[sttWorker] Received STOP during worklet initialization.')] } // Cleanup audio context if stopped here
+                STOP: { actions: [log('[sttWorker] Received STOP during worklet initialization (ignored, waiting for CLEANUP).')] }, // Cleanup removed
+                CLEANUP: { // <<< Added CLEANUP handler
+                    target: 'stopped',
+                    actions: [
+                        log('[sttWorker] Received CLEANUP during worklet initialization.'),
+                        'markAsStopping',
+                        'removeWorkletListeners',
+                        'stopAudioProcessing',
+                        'stopRecorder'
+                    ]
+                }
             }
         },
         listening: {
@@ -582,30 +631,35 @@ export const sttMachine = setup({
             entry: [
                 log('[sttWorker] Entering listening state (Worklet running)...'),
             ],
-            // No invoke needed, worklet runs
             on: {
-                VAD_SPEECH_START: { // From worklet
+                VAD_SPEECH_START: {
                      target: 'recording',
                      actions: log('[sttWorker] VAD_SPEECH_START event received.')
                  },
-                 WORKLET_RMS_UPDATE: { // From worklet
-                     actions: ['assignRmsLevel', 'sendRmsUpdateToParent', /* Optional: Throttled log here */ ] // Use string name, send update to parent
+                 WORKLET_RMS_UPDATE: {
+                     actions: ['assignRmsLevel', 'sendRmsUpdateToParent']
                  },
-                 WORKLET_ERROR: { // From worklet or setup
+                 WORKLET_ERROR: {
                     target: 'stopped',
                     actions: [
                         'markAsStopping',
+                        // removeWorkletListeners removed
                         log('[sttWorker/Event] !!! WORKLET_ERROR received in listening state !!!'),
                         'assignWorkletError',
                         'sendErrorToParent'
                     ]
                  },
-                 STOP: { 
+                 STOP: {
+                    actions: [log('[sttWorker/Event] !!! STOP received in listening state (ignored, waiting for CLEANUP) !!!')] // Cleanup removed
+                 },
+                 CLEANUP: { // <<< Added CLEANUP handler
                     target: 'stopped',
                     actions: [
-                        'markAsStopping',
-                        'removeWorkletListeners',
-                        log('[sttWorker/Event] !!! STOP received in listening state !!!')
+                        log('[sttWorker] Received CLEANUP in listening state.'),
+                        'markAsStopping', // Mark immediately
+                        'removeWorkletListeners', // Try stopping/removing listeners NOW
+                        'stopAudioProcessing', // Disconnect nodes NOW
+                        'stopRecorder' // Stop recorder NOW (might be inactive, but safe)
                     ]
                 }
             },
@@ -615,65 +669,74 @@ export const sttMachine = setup({
             id: 'recordingState',
             entry: [
                 log('[sttWorker] Entering recording state (Worklet running)...'),
-                'startRecorder' // Start MediaRecorder
+                'startRecorder'
             ],
-             // No invoke needed, worklet runs
             on: {
                 RECORDING_DATA_AVAILABLE: { actions: 'appendAudioChunk' },
-                VAD_SILENCE_START: { // From worklet
+                VAD_SILENCE_START: {
                     target: 'waitingForProcessing',
                     guard: 'hasAudioChunks',
                     actions: [
                         log('[sttWorker] VAD_SILENCE_START received. Sending event to parent...'),
-                        'sendSilenceToParent' // Use string name
+                        'sendSilenceToParent'
                     ]
                 },
-                WORKLET_RMS_UPDATE: { // From worklet
-                    actions: ['assignRmsLevel', 'sendRmsUpdateToParent', /* Optional: Throttled log here */ ] // Use string name, send update to parent
+                WORKLET_RMS_UPDATE: {
+                    actions: ['assignRmsLevel', 'sendRmsUpdateToParent']
                 },
-                 WORKLET_ERROR: { // From worklet
+                 WORKLET_ERROR: {
                     target: 'stopped',
                     actions: [
                         'markAsStopping',
+                        // removeWorkletListeners removed
                         'assignWorkletError',
                         'sendErrorToParent',
                         log('[sttWorker] Worklet error received during recording.')
                     ]
                  },
                 STOP: {
+                    actions: [log('[sttWorker] Received STOP during recording (ignored, waiting for CLEANUP).')] // Cleanup removed
+                },
+                CLEANUP: { // <<< Added CLEANUP handler
                     target: 'stopped',
                     actions: [
+                        log('[sttWorker] Received CLEANUP during recording.'),
                         'markAsStopping',
                         'removeWorkletListeners',
-                        log('[sttWorker] Received STOP during recording.')
+                        'stopAudioProcessing',
+                        'stopRecorder' // Definitely needs to be stopped here
                     ]
                 }
             },
-            // Stop recorder and worklet processing on exit
-            exit: ['stopRecorder', 'stopAudioProcessing', log('[sttWorker] Exiting recording state.')]
+            // Stop recorder and worklet processing on exit -- Keep these on normal exit?
+            // Let's remove them here too, as the normal exit (VAD_SILENCE_START) leads to waiting, not stopping.
+            // Cleanup on transition to stopped is now handled by CLEANUP or final state entry.
+            exit: [log('[sttWorker] Exiting recording state.')]
         },
         waitingForProcessing: {
              id: 'waitingState',
-             entry: log('[sttWorker] Entering waitingForProcessing state (Worklet may still run? Needs clarification)...'),
-             // Worklet might still be running here to detect next speech start?
-             // Or should it be stopped on VAD_SILENCE_START?
-             // For now, assume it stops on exit from recording.
+             entry: log('[sttWorker] Entering waitingForProcessing state...'),
              on: {
                  PROCESS_CHUNKS: {
                      target: 'processing',
                      actions: log('[sttWorker] Received PROCESS_CHUNKS, moving to processing.')
                  },
                  STOP: {
-                      target: 'stopped',
-                      actions: [
-                          'markAsStopping',
-                          'removeWorkletListeners',
-                          log('[sttWorker] Received STOP while waiting for processing.')
-                      ]
-                  }
-                 // Need to handle WORKLET_ERROR here too?
+                     actions: [log('[sttWorker] Received STOP while waiting for processing (ignored, waiting for CLEANUP).')] // Cleanup removed
+                  },
+                 CLEANUP: { // <<< Added CLEANUP handler
+                    target: 'stopped',
+                    actions: [
+                        log('[sttWorker] Received CLEANUP while waiting for processing.'),
+                        'markAsStopping',
+                        'removeWorkletListeners', // Should already be inactive, but safe
+                        'stopAudioProcessing', // Should already be inactive, but safe
+                        'stopRecorder' // Should already be stopped, but safe
+                    ]
+                 }
+                 // TODO: Add WORKLET_ERROR handler? Yes, good practice.
+                 // WORKLET_ERROR: { target: 'stopped', actions: [...] }
              },
-             // No exit action needed?
         },
         processing: {
              id: 'processingState',
@@ -687,17 +750,20 @@ export const sttMachine = setup({
                     token: context.apiToken
                 }),
                 onDone: {
-                    target: 'stopped', // Go to final state
+                    target: 'stopped',
                     actions: [
+                        'markAsStopping', // Keep markAsStopping
+                        // removeWorkletListeners removed (already stopped)
                         'clearAudioChunks',
                         'sendResultToParent',
                         log('[sttWorker] Transcription successful, stopping worker.')
                     ]
                 },
                 onError: {
-                    target: 'stopped', // Go to final state
+                    target: 'stopped',
                     actions: [
-                        'markAsStopping',
+                        'markAsStopping', // Keep markAsStopping
+                        // removeWorkletListeners removed (already stopped)
                         'clearAudioChunks',
                         'assignError',
                         'sendErrorToParent',
@@ -707,22 +773,28 @@ export const sttMachine = setup({
             },
             on: {
                  STOP: {
-                     // Maybe allow stopping transcription actor? Needs cancellation.
-                     // For now, log and let it finish.
-                     actions: log('[sttWorker] Received STOP during processing (ignored, will finish/error out).')
+                     actions: log('[sttWorker] Received STOP during processing (ignored, waiting for CLEANUP or completion).') // Let transcription finish
+                 },
+                 CLEANUP: { // <<< Added CLEANUP handler (stops transcription?)
+                    // It's tricky to cancel the transcription actor easily.
+                    // Let's just log for now and let it transition to stopped on completion/error.
+                    // The manager will call stopChild anyway.
+                    actions: log('[sttWorker] Received CLEANUP during processing (ignored, will stop on completion/error).')
                  }
             }
         },
         stopped: {
             type: 'final',
-            entry: [ // Add cleanup on final entry
-                'markAsStopping', // Ensure flag is set on final entry too
-                'removeWorkletListeners', // Ensure listeners are removed first
-                log('[sttWorker] Entering final stopped state.'),
-                'stopRecorder', // Ensure recorder is stopped
-                'stopAudioProcessing', // Ensure worklet processing is stopped (now removes listeners too)
-                'closeAudioContext', // Close the audio context
-                'clearAudioNodes', // Clear context refs
+            entry: [
+                // <<< Reordered cleanup actions >>>
+                'markAsStopping', // Ensure flag is set immediately
+                log('[sttWorker] Entering final stopped state. Performing final cleanup.'),
+                // Main stopping actions moved to CLEANUP handlers
+                // 'removeWorkletListeners', // Remove handlers & try closing port first
+                // 'stopAudioProcessing',    // Ensure port is closed & disconnect nodes
+                // 'stopRecorder',         // Stop the recorder
+                'closeAudioContext',    // Close the main audio context
+                'clearAudioNodes',      // Clear node references
             ]
         }
     }

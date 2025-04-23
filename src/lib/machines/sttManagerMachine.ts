@@ -164,9 +164,9 @@ export const sttManagerMachine = setup({
 			errorMessage: null
 		}),
 		assignError: assign({
-			errorMessage: ({ event }) => {
+			errorMessage: ({ context, event }) => {
 				console.error("[sttManager] Error event received:", event);
-				let message = 'An unknown manager error occurred';
+				let message = context.errorMessage ?? 'An unknown manager error occurred';
 
 				if (event.type === 'WORKER_ERROR') {
 					message = event.error;
@@ -191,16 +191,22 @@ export const sttManagerMachine = setup({
 		}),
 		assignPermissionDeniedError: assign({ errorMessage: 'Microphone permission denied.' }),
 		stopAllWorkersAction: ({ context }: { context: SttManagerContext }) => {
-			console.warn('[/ActiosttManagern] !!! stopAllWorkersAction called !!!');
+			console.warn('[sttManager/Action] !!! stopAllWorkersAction called (sending CLEANUP) !!!');
 			const workersToStop: ActorRefFrom<typeof sttMachine>[] = [];
 			if (context.activeWorker) {
-				workersToStop.push(context.activeWorker); // No cast needed now
+				workersToStop.push(context.activeWorker);
 			}
-			workersToStop.push(...context.processingWorkers); // No cast needed now
+			workersToStop.push(...context.processingWorkers);
 
 			if (workersToStop.length > 0) {
-				console.log(`[sttManager] Generating stop actions for ${workersToStop.length} workers.`);
-				return workersToStop.map(worker => stopChild(worker));
+				console.log(`[sttManager] Sending CLEANUP to ${workersToStop.length} workers (will self-terminate).`);
+				// Send CLEANUP event ONLY
+				const cleanupActions = workersToStop.map(worker => sendTo(worker, { type: 'CLEANUP' }));
+				// REMOVE stopChild actions
+				// const stopActions = workersToStop.map(worker => stopChild(worker));
+				// Return combined actions
+				// return [...cleanupActions, ...stopActions];
+				return cleanupActions; // Return only cleanup actions
 			}
 			return [];
 		},
@@ -348,6 +354,13 @@ export const sttManagerMachine = setup({
 				return context.rmsLevel; // Keep existing if wrong event
 			}
 		}),
+		sendErrorToParent: sendParent(({ context }) => {
+			console.log(`[sttManager] Sending WORKER_ERROR to parent: ${context.errorMessage}`);
+			return {
+				type: 'WORKER_ERROR',
+				error: context.errorMessage ?? 'Unknown manager error occurred'
+			};
+		})
 	},
 	guards: {
 		hasActiveStream: ({ context }) => !!context.managerAudioStream && context.managerAudioStream.active,
