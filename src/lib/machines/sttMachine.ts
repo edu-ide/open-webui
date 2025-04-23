@@ -1,7 +1,8 @@
-import { setup, assign, fromPromise, log, sendTo, type ActorRefFrom, fromCallback, type DoneActorEvent, sendParent, type AnyActorRef } from 'xstate';
+import { setup, assign, fromPromise, log, sendTo, type ActorRefFrom, fromCallback, type DoneActorEvent, sendParent, type AnyActorRef, type ErrorActorEvent, type PromiseActorLogic } from 'xstate';
 import { blobToFile } from '$lib/utils'; // Assuming utils exists
 
 // --- Types ---
+const AUDIO_WORKLET_PATH = '/audio-processor.js'; // Path relative to public root
 
 // Internal helper function
 const calculateRMS = (data: Uint8Array): number => {
@@ -13,47 +14,81 @@ const calculateRMS = (data: Uint8Array): number => {
 	return Math.sqrt(sumSquares / data.length);
 };
 
-// Modified Context: Stream is now required input
+// Modified Context: Added Audio Worklet related fields
 export interface SttContext {
     parent: AnyActorRef | undefined; // Reference to the parent actor
     audioStream: MediaStream; // Now required via input
     mediaRecorder: MediaRecorder | null;
     audioChunks: Blob[];
-    // transcribedText: string | null; // Worker doesn't need to hold final text
     errorMessage: string | null;
     minDecibels: number;
     silenceDuration: number;
     transcribeFn: (token: string, audioFile: File) => Promise<{ text: string }>; // Required via input
     apiToken: string; // Required via input
-    // Audio Analysis State
+    // --- Audio Worklet State ---
+    audioContext: AudioContext | null;
+    sourceNode: MediaStreamAudioSourceNode | null;
+    audioWorkletNode: AudioWorkletNode | null;
+    isWorkletReady: boolean;
     rmsLevel: number;
-    // Remove audioContext and analyserNode if managed within the service
+    isStopping: boolean; // Flag to indicate the actor is stopping
 }
 
-// Modified Events: Added parent communication and control events
+// Modified Events: Removed old analysis events, added worklet events
 export type SttEvent =
-    // | { type: 'START_LISTENING'; payload?: { token?: string | null } } // Removed, started by manager
-    // | { type: 'STOP_LISTENING' } // Removed, controlled by manager via STOP
-    // | { type: 'PERMISSION_GRANTED'; stream: MediaStream } // Removed, handled by manager
-    // | { type: 'PERMISSION_DENIED'; error: string } // Removed, handled by manager
-    | { type: 'INITIALIZATION_COMPLETE'; recorder: MediaRecorder }
-    | { type: 'INITIALIZATION_FAILED'; error: string }
-    | { type: 'SOUND_DETECTED' }
-    | { type: 'SILENCE_DETECTED' }
-    | { type: '_AUDIO_ANALYSIS_UPDATE'; rms: number }
-    | { type: 'RECORDING_DATA_AVAILABLE'; data: Blob }
+    // Commands/Info from Manager
     | { type: 'PROCESS_CHUNKS' } // Sent by manager
     | { type: 'STOP' } // Sent by manager
-    // | { type: 'TRANSCRIPTION_SUCCESS'; text: string } // Internal event from actor
-    // | { type: 'TRANSCRIPTION_ERROR'; error: string } // Internal event from actor
-    // | { type: 'RESET' }; // Removed, managed by manager lifecycle
+    // Internal Events: Initialization
+    | { type: 'INITIALIZATION_COMPLETE'; recorder: MediaRecorder } // Kept for recorder
+    | { type: 'INITIALIZATION_FAILED'; error: string } // Kept for recorder error
+    // Internal Events: Recording
+    | { type: 'RECORDING_DATA_AVAILABLE'; data: Blob }
+    // --- Audio Worklet Events ---
+    | { type: 'WORKLET_RMS_UPDATE'; value: number }
+    | { type: 'VAD_SPEECH_START' } // From worklet
+    | { type: 'VAD_SILENCE_START' } // From worklet
+    | { type: 'WORKLET_READY' } // From worklet setup actor
+    | { type: 'WORKLET_ERROR'; error: string } // From worklet or setup actor
+    // Events sent back FROM actors
+    | DoneActorEvent<MediaRecorder, 'initializeRecorderActor'>
+    | DoneActorEvent<{ audioContext: AudioContext }, 'audioWorkletSetupActor'> // Added for worklet setup
+    | DoneActorEvent<{ text: string }, 'transcriptionActor'>
+    | ErrorActorEvent // General actor errors (covers worklet setup too)
+    | { type: 'AUDIO_CHUNK'; data: Blob } // Keep? Seems redundant with RECORDING_DATA_AVAILABLE
 
-    // Events sent back FROM actors (need proper typing)
-    | DoneActorEvent<MediaRecorder> // From initializeRecorderActor
-    | DoneActorEvent<{ text: string }> // From transcriptionActor
-    | { type: 'error.actor'; error: unknown; id: string } // General actor errors
+// --- Actors ---
 
-    | { type: 'AUDIO_CHUNK'; data: Blob }
+// Audio Worklet Setup Actor (adapted from whisperLiveSttMachine)
+const audioWorkletSetupActor = fromPromise<{ audioContext: AudioContext }>(async () => {
+	console.log('[sttWorker/AudioInit] Initializing AudioContext and Worklet...');
+	let audioContext: AudioContext | null = null;
+	try {
+		audioContext = new AudioContext();
+		console.log(`[sttWorker/AudioInit] AudioContext created. State: ${audioContext.state}`);
+		if (audioContext.state === 'suspended') {
+			console.log('[sttWorker/AudioInit] AudioContext suspended, attempting resume...');
+			await audioContext.resume();
+			console.log(`[sttWorker/AudioInit] AudioContext resumed. State: ${audioContext.state}`);
+		}
+		if (audioContext.state !== 'running') {
+			console.error(`[sttWorker/AudioInit] AudioContext state is '${audioContext.state}', not 'running'.`);
+            throw new Error(`AudioContext state is '${audioContext.state}', not 'running'. User interaction might be required.`);
+		}
+        console.log(`[sttWorker/AudioInit] Attempting to add module: ${AUDIO_WORKLET_PATH}`);
+		await audioContext.audioWorklet.addModule(AUDIO_WORKLET_PATH);
+		console.log('[sttWorker/AudioInit] AudioWorklet module added successfully.');
+		return { audioContext };
+	} catch (e: any) {
+        console.error('[sttWorker/AudioInit] Error during AudioContext/Worklet setup:', e);
+        if (audioContext && audioContext.state !== 'closed') {
+            console.log('[sttWorker/AudioInit] Closing AudioContext due to setup error.');
+            audioContext.close().catch(() => {});
+        }
+		throw new Error(`Audio initialization failed: ${e.message || e}`);
+	}
+});
+
 
 // --- Machine Setup ---
 
@@ -61,12 +96,9 @@ export const sttMachine = setup({
     types: {
         context: {} as SttContext,
         events: {} as SttEvent,
-        // Input now includes required fields
         input: {} as Pick<SttContext, 'audioStream' | 'minDecibels' | 'silenceDuration' | 'transcribeFn' | 'apiToken' | 'parent'>
     },
     actors: {
-        // micPermissionActor removed
-        // ... existing code ...
         initializeRecorderActor: fromPromise(async ({ input }: { input: { stream: MediaStream } }) => {
             // Keep internal logging for worker debugging if needed
             console.log('[sttWorker] Initializing MediaRecorder with stream:', input.stream);
@@ -136,158 +168,60 @@ export const sttMachine = setup({
             console.log('[sttWorker] Transcription successful:', result);
             return result;
         }),
-        // audioAnalysisService remains largely the same internally
-        audioAnalysisService: fromCallback<SttEvent, { stream: MediaStream, minDecibels: number, silenceDuration: number }>(({ input, sendBack, self }) => {
-             console.log('[sttWorker/audioAnalysisService] Actor starting...');
-            const { stream, minDecibels, silenceDuration } = input;
-             console.log('[sttWorker/audioAnalysisService] Received input - stream:', stream.id, 'minDecibels:', minDecibels, 'silenceDuration:', silenceDuration);
-             // Check if stream is active
-             if (!stream || !stream.active) {
-                 console.error('[sttWorker/audioAnalysisService] Received inactive stream.');
-                 // Send an error back immediately?
-                 // sendBack({ type: 'ANALYSIS_ERROR', error: 'Inactive stream provided' });
-                 return; // Stop execution
-             }
-             // ... rest of the analysis service logic ...
-             // Ensure it uses the correct `sendBack` for events like SOUND_DETECTED, SILENCE_DETECTED, _AUDIO_ANALYSIS_UPDATE
-             let audioContext: AudioContext | null = null;
-             let analyser: AnalyserNode | null = null;
-             let source: MediaStreamAudioSourceNode | null = null;
-             let animationFrameId: number | null = null;
-             let silenceTimeoutId: ReturnType<typeof setTimeout> | null = null;
-             let wasSoundDetected = false;
-             let isSilent = true;
-
-             try {
-                 audioContext = new AudioContext();
-                 source = audioContext.createMediaStreamSource(stream);
-                 analyser = audioContext.createAnalyser();
-                 analyser.minDecibels = minDecibels;
-                 analyser.maxDecibels = -30;
-                 source.connect(analyser);
-
-                 const bufferLength = analyser.frequencyBinCount;
-                 const domainData = new Uint8Array(bufferLength);
-                 const timeDomainData = new Uint8Array(analyser.fftSize);
-
-                 const loop = () => {
-                     if (!analyser || !audioContext || audioContext.state === 'closed') {
-                         console.log('[sttWorker/audioAnalysisService] Analysis loop stopping (context closed or analyser missing).');
-                         return;
-                     }
-                     analyser.getByteTimeDomainData(timeDomainData);
-                     analyser.getByteFrequencyData(domainData);
-                     const rms = calculateRMS(timeDomainData);
-                     const hasSound = domainData.some(value => value > 0);
-
-                     sendBack({ type: '_AUDIO_ANALYSIS_UPDATE', rms });
-
-                     if (hasSound) {
-                         isSilent = false;
-                         if (silenceTimeoutId) { clearTimeout(silenceTimeoutId); silenceTimeoutId = null; }
-                         if (!wasSoundDetected) {
-                             console.log('[sttWorker/audioAnalysisService] SOUND DETECTED');
-                             sendBack({ type: 'SOUND_DETECTED' });
-                             wasSoundDetected = true;
-                         }
-                     } else {
-                         if (!isSilent && !silenceTimeoutId) {
-                             console.log(`[sttWorker/audioAnalysisService] Silence started, timeout ${silenceDuration}ms`);
-                             silenceTimeoutId = setTimeout(() => {
-                                 console.log('[sttWorker/audioAnalysisService] SILENCE DETECTED (timeout)');
-                                 sendBack({ type: 'SILENCE_DETECTED' });
-                                 silenceTimeoutId = null;
-                                 isSilent = true;
-                                 wasSoundDetected = false;
-                             }, silenceDuration);
-                         }
-                         isSilent = true;
-                     }
-                     animationFrameId = requestAnimationFrame(loop);
-                 };
-                 animationFrameId = requestAnimationFrame(loop);
-
-             } catch (err: any) {
-                  console.error('[sttWorker/audioAnalysisService] Error starting:', err);
-                  if (source) source.disconnect();
-                  if (audioContext && audioContext.state !== 'closed') audioContext.close();
-                  if (animationFrameId) cancelAnimationFrame(animationFrameId);
-                  if (silenceTimeoutId) clearTimeout(silenceTimeoutId);
-                  // Send error back to machine?
-                  // sendBack({ type: 'ANALYSIS_ERROR', error: err.message });
-                  return;
-             }
-
-             return () => {
-                 console.log(`[sttWorker/audioAnalysisService] Stopping analysis for worker ${self.id}...`);
-                 if (animationFrameId) cancelAnimationFrame(animationFrameId);
-                 if (silenceTimeoutId) clearTimeout(silenceTimeoutId);
-                 if (source) source.disconnect();
-                 if (analyser) analyser.disconnect();
-                 if (audioContext && audioContext.state !== 'closed') {
-                     audioContext.close().catch(e => console.error('Error closing AudioContext:', e));
-                 }
-             };
-        })
+        audioWorkletSetupActor // Added
     },
     actions: {
         assignRecorder: assign({
             mediaRecorder: ({ event }) => {
-                return (event as DoneActorEvent<MediaRecorder>).output;
+                // Ensure type safety
+                if (event.type === 'xstate.done.actor.initializeRecorderActor') {
+                    return event.output;
+                }
+                return null; // Or context.mediaRecorder if you want to keep existing on wrong event
             }
         }),
         assignError: assign({
             errorMessage: ({ event }) => {
                 console.error("[sttWorker] Error event received:", event);
                 let message = 'An unknown worker error occurred';
-                // Prioritize actor errors
-                if (event.type === 'error.actor') {
+                if ('error' in event && event.type.startsWith('xstate.error.actor.')) { 
+                    const errorEvent = event as ErrorActorEvent; // Type assertion
                     const errorData = event.error;
                     if (errorData instanceof Error) message = errorData.message;
                     else if (typeof errorData === 'string') message = errorData;
-                    else try { message = JSON.stringify(errorData); } catch { /* ignore */ }
-                } else if (event.type === 'INITIALIZATION_FAILED') { // Keep specific init failed
+                    else try { message = JSON.stringify(errorData); } catch { message = 'Unknown actor error data'; }
+                } else if (event.type === 'INITIALIZATION_FAILED') {
                     message = event.error;
+                } else if (event.type === 'WORKLET_ERROR') { // Handle worklet error event
+                    message = `Worklet Error: ${event.error}`;
                 }
-                // else if ('data' in event && event.data) { // Handle errors from promises (like initializeRecorderActor)
-                //     const errorData = event.data;
-                //     if (errorData instanceof Error) message = errorData.message;
-                //     else if (typeof errorData === 'string') message = errorData;
-                //     else try { message = JSON.stringify(errorData); } catch { /* ignore */ }
-                // }
                 console.log(`[sttWorker] Assigning error message: ${message}`);
                 return message;
             }
-            // No context clearing here, happens on stop/manager decision
         }),
-        // clearError removed (errors lead to stopped state or are handled by manager)
-        // startRecorder/stopRecorder remain similar but logs adjusted
         startRecorder: ({ context }) => {
             if (context.mediaRecorder && context.mediaRecorder.state === 'inactive') {
                 console.log('[sttWorker] Starting media recorder with timeslice...');
-                context.mediaRecorder.start(500); // Use a reasonable timeslice
+                context.mediaRecorder.start(500);
             } else {
                 console.warn('[sttWorker] Recorder not ready or already recording.');
             }
         },
-         // Action to setup recorder listeners
          setupRecorderListeners: ({ context, self }) => {
              if (context.mediaRecorder) {
                  console.log('[sttWorker] Setting up MediaRecorder listeners...');
                  context.mediaRecorder.ondataavailable = (event) => {
                      if (event.data.size > 0) {
-                         // Use self.send to send the event to the machine instance
                          self.send({ type: 'RECORDING_DATA_AVAILABLE', data: event.data });
                      }
                  };
                  context.mediaRecorder.onstop = () => {
                       console.log('[sttWorker] MediaRecorder stopped.');
-                      // Optionally send an internal event if needed
                  };
                  context.mediaRecorder.onerror = (event) => {
                       console.error('[sttWorker] MediaRecorder error:', event);
-                      // Send error event to the machine
-                      self.send({ type: 'INITIALIZATION_FAILED', error: 'MediaRecorder error' }); // Reuse or create specific event?
+                      // Send a general error event? Or use existing?
+                      self.send({ type: 'INITIALIZATION_FAILED', error: 'MediaRecorder error' });
                  };
              } else {
                  console.error('[sttWorker] Cannot setup listeners, MediaRecorder is null.');
@@ -320,272 +254,476 @@ export const sttMachine = setup({
         }),
         // clearAudioChunks remains useful before processing
         clearAudioChunks: assign({ audioChunks: [] }),
-        // closeAudioStream removed - manager handles stream
-        // resetContext removed - manager handles lifecycle
-        // updateToken removed - token passed via input
-        assignAnalysisUpdate: assign({
+        // assignAnalysisUpdate removed -> assignRmsLevel added
+        assignRmsLevel: assign({
             rmsLevel: ({ context, event }) => {
-                if (event.type === '_AUDIO_ANALYSIS_UPDATE') {
-                     return event.rms;
-                 }
-                 return context.rmsLevel;
+                if (event.type === 'WORKLET_RMS_UPDATE') {
+                    return event.value;
+                }
+                return context.rmsLevel;
             },
         }),
-        // resetAnalysisContextOnError removed
-        // --- New Actions for Parent Communication ---
-        sendSilenceToParent: sendParent(({ self }) => ({ type: 'WORKER_SILENCE_DETECTED', workerRef: self })),
-        sendResultToParent: sendParent(
-            ({ context, event, self }) => {
-                // Explicitly type the event for this specific context
-                const doneEvent = event as DoneActorEvent<{ text: string }>;
-                let textToSend = ''; // Default to empty string
+        // --- Actions for Audio Worklet ---
+        assignAudioContextAndWorkletReady: assign({
+            audioContext: ({ event }) => {
+                 if (event.type === 'xstate.done.actor.audioWorkletSetupActor') {
+                    return event.output.audioContext;
+                 }
+                 return null; // Or keep existing context?
+            },
+            isWorkletReady: true,
+            errorMessage: null, // Clear error on success
+        }),
+        assignWorkletError: assign({
+            isWorkletReady: false,
+            errorMessage: ({ event }) => {
+                if (event.type === 'WORKLET_ERROR') {
+                    return `Audio Worklet error: ${event.error}`;
+                }
+                if ('error' in event && event.type === 'xstate.error.actor.audioWorkletSetupActor') {
+                    const error = (event as ErrorActorEvent).error;
+                    return `Audio Worklet setup failed: ${error instanceof Error ? error.message : 'Unknown error'}`;
+                }
+                return 'Unknown audio processing error';
+            },
+            // Consider transitioning to error state? For now, just assign context.
+        }),
+        setupAndStartAudioProcessing: assign(( { context, self } ) => {
+            console.log('[sttWorker] Executing setupAndStartAudioProcessing action...');
+			if (!context.audioContext || !context.audioStream || !context.isWorkletReady) {
+                console.error('[sttWorker] setupAndStartAudioProcessing: Pre-requisites not met!', {
+                    hasContext: !!context.audioContext,
+                    hasStream: !!context.audioStream,
+                    isWorkletReady: context.isWorkletReady
+                });
+				self.send({ type: 'WORKLET_ERROR', error: 'Pre-requisites not met for audio setup'});
+				return {}; // Return empty object to avoid changing context on error here
+			}
+			let sourceNode: MediaStreamAudioSourceNode | null = null;
+			let audioWorkletNode: AudioWorkletNode | null = null;
+			try {
+                console.log('[sttWorker] setupAndStartAudioProcessing: Creating AudioWorkletNode...');
+				if (context.sourceNode) { try { context.sourceNode.disconnect(); } catch {} }
+				if (context.audioWorkletNode) { try { context.audioWorkletNode.disconnect(); context.audioWorkletNode.port.close(); } catch {} }
 
-                // Check the correct event type AND if the output exists and has text
+				audioWorkletNode = new AudioWorkletNode(context.audioContext, 'audio-processor');
+                console.log('[sttWorker] setupAndStartAudioProcessing: AudioWorkletNode created.');
+
+                console.log('[sttWorker] setupAndStartAudioProcessing: Creating MediaStreamSourceNode...');
+				sourceNode = context.audioContext.createMediaStreamSource(context.audioStream);
+                console.log('[sttWorker] setupAndStartAudioProcessing: Connecting nodes...');
+				sourceNode.connect(audioWorkletNode);
+				// Do NOT connect workletNode to destination
+
+                console.log('[sttWorker] setupAndStartAudioProcessing: Sending start message to worklet...');
+				audioWorkletNode.port.postMessage({ type: 'start' });
+				console.log('[sttWorker] Audio graph connected & worklet start message sent.');
+
+				// <<< Log the node object right before returning for assignment >>>
+				console.log('[sttWorker/Action] Returning audioWorkletNode for assignment:', audioWorkletNode);
+				return { sourceNode, audioWorkletNode, errorMessage: null }; // Don't set isAudioProcessing flag here
+
+			} catch (error: any) {
+				console.error('[sttWorker] setupAndStartAudioProcessing: Error setting up media graph:', error);
+				console.warn('[sttWorker/Action] !!! ERROR in setupAndStartAudioProcessing catch block. Sending WORKLET_ERROR !!!');
+				self.send({ type: 'WORKLET_ERROR', error: `Audio graph setup failed: ${error instanceof Error ? error.message : 'Unknown'}` });
+				return { sourceNode: null, audioWorkletNode: null }; // Clear nodes on error
+			}
+		}),
+		stopAudioProcessing: ({ context }) => {
+             console.warn('[sttWorker/Action] WARNING: stopAudioProcessing called.');
+             console.log('[sttWorker] Stopping audio processing (worklet)...');
+ 			if (context.audioWorkletNode) {
+ 				try {
+ 					context.audioWorkletNode.port.close();
+ 				} catch (e) { console.warn('[sttWorker] Error stopping worklet port:', e); }
+ 			}
+ 			try { context.sourceNode?.disconnect(); } catch {}
+             // Do NOT stop the main audioStream tracks here - manager owns the stream
+ 			console.log('[sttWorker] Audio processing stopped.');
+        },
+        clearAudioNodes: assign({ // Renamed from clearAudioContextRef maybe?
+            sourceNode: null,
+            audioWorkletNode: null,
+            audioContext: null, // Close context separately
+            isWorkletReady: false,
+        }),
+        closeAudioContext: ({ context }) => {
+            console.warn('[sttWorker/Action] WARNING: closeAudioContext called.');
+            if (context.audioContext?.state !== 'closed') {
+                context.audioContext?.close().catch(e => console.error('[sttWorker] Error closing AC:', e));
+            }
+        },
+		// --- Parent Communication ---
+		sendSilenceToParent: sendParent(({ self }) => ({ type: 'WORKER_SILENCE_DETECTED', workerRef: self })), // Triggered by VAD_SILENCE_START now
+		sendRmsUpdateToParent: sendParent(({ event, self }) => {
+            // Type guard for the event
+            if (event.type === 'WORKLET_RMS_UPDATE') {
+                // console.log(`[sttWorker] Sending WORKER_RMS_UPDATE: ${event.value.toFixed(4)} from worker ${self.id}`); // Optional: Throttled log if needed
+                return { type: 'WORKER_RMS_UPDATE', value: event.value, workerRef: self };
+            }
+            // Should not happen if called correctly, but return undefined to satisfy types
+            console.warn('[sttWorker] sendRmsUpdateToParent called with wrong event type:', event.type);
+            return undefined;
+        }),
+		sendResultToParent: sendParent(
+            ({ context, event, self }) => {
+                const doneEvent = event as DoneActorEvent<{ text: string }>;
+                let textToSend = '';
                 if (doneEvent.type === 'xstate.done.actor.transcriptionActor' && typeof doneEvent.output?.text === 'string') {
                     textToSend = doneEvent.output.text;
                 } else {
-                    // Log if transcription succeeded but returned nothing or unexpected type
                     console.log('[sttWorker] No valid text found in transcription result, sending empty result.');
                 }
-
                 console.log(`[sttWorker] Sending WORKER_TRANSCRIPTION_RESULT: "${textToSend}" from worker ${self.id}`);
-                // Include workerRef in the event payload
                 return { type: 'WORKER_TRANSCRIPTION_RESULT', text: textToSend, workerRef: self };
-
-                // return { type: 'ignore' }; // Should not happen if called correctly
             }
         ),
         sendErrorToParent: sendParent(
-            ({ context, event }) => {
-                // Extract error message from context or event
+             ({ context, event }) => {
                 let errorMessage = context.errorMessage || 'Unknown worker error';
-                // If triggered by actor error event, use that specific error
-                if (event.type === 'error.actor' && event.id === 'transcriptionActor') {
+                if ('error' in event && event.type === 'xstate.error.actor.transcriptionActor') {
                      const errorData = event.error;
                       if (errorData instanceof Error) errorMessage = errorData.message;
                       else if (typeof errorData === 'string') errorMessage = errorData;
                       else try { errorMessage = JSON.stringify(errorData); } catch { /* ignore */ }
                       console.error('[sttWorker] Transcription actor failed:', errorMessage);
-                } else if (event.type === 'error.actor' && event.id === 'initializeRecorderActor') {
+                } else if ('error' in event && event.type === 'xstate.error.actor.initializeRecorderActor') {
                      const errorData = event.error;
                       if (errorData instanceof Error) errorMessage = errorData.message;
                       else if (typeof errorData === 'string') errorMessage = errorData;
                       else try { errorMessage = JSON.stringify(errorData); } catch { /* ignore */ }
                       console.error('[sttWorker] Initialize recorder actor failed:', errorMessage);
+                } else if ('error' in event && event.type === 'xstate.error.actor.audioWorkletSetupActor') {
+                     const errorData = event.error;
+                      if (errorData instanceof Error) errorMessage = errorData.message;
+                      else if (typeof errorData === 'string') errorMessage = errorData;
+                      else try { errorMessage = JSON.stringify(errorData); } catch { /* ignore */ }
+                      console.error('[sttWorker] AudioWorkletSetup actor failed:', errorMessage);
+                } else if (event.type === 'WORKLET_ERROR') { // Handle direct worklet error
+                    errorMessage = `Worklet Error: ${event.error}`;
                 }
-                 // Use the message stored in context if available (from assignError)
                  errorMessage = context.errorMessage || errorMessage;
-
                 console.log(`[sttWorker] Sending WORKER_ERROR: ${errorMessage}`);
                 return { type: 'WORKER_ERROR', error: errorMessage };
             }
-        )
+        ),
+        // New action to set up worklet message handlers AFTER the node is assigned to context
+        setupWorkletMessageHandler: ({ context, self }) => {
+            console.log('[sttWorker/Action] setupWorkletMessageHandler called.');
+            let lastLogTime = 0; // Variable to track last log time for throttling
+            if (!context.audioWorkletNode) {
+                console.error('[sttWorker/Action] Cannot setup handlers: audioWorkletNode is null in context.');
+                // Optionally send an error event back to self?
+                // self.send({ type: 'WORKLET_ERROR', error: 'Failed to setup handlers, node missing' });
+                return;
+            }
+            // Assign handlers using the 'self' reference from the action arguments
+            context.audioWorkletNode.port.onmessage = (ev: MessageEvent) => {
+              
+                // Log the received data structure
+                // --- Throttled logging --- 
+                const now = Date.now();
+
+                // <<< Check if actor is stopping or stopped >>>
+                if (context.isStopping) {
+                    // Optional: Log that the message is being ignored due to stopping flag.
+                    // console.log('[sttWorker/onmessage] Ignoring message: isStopping flag is true.');
+                    return;
+                }
+                if (self.getSnapshot().status === 'done') {
+                    // Optional: Log that the message is being ignored.
+                    // console.log('[sttWorker/onmessage] Ignoring message: Actor is stopped.');
+                    return;
+                }
+
+                if (now - lastLogTime > 1000) { // Log max once per second
+                    lastLogTime = now;
+                }
+                // ------------------------- 
+ 
+                // Handle messages from worklet and send as machine events
+                if (ev.data?.type === 'RMS_UPDATE') {
+                    if (now - lastLogTime === 0) console.log('[sttWorker/onmessage] Handling RMS_UPDATE (throttled)...'); // Log details only when throttled log is printed
+                    try { self.send({ type: 'WORKLET_RMS_UPDATE', value: ev.data.value }); } catch (e) { /* ignore error if actor stopped */ }
+                } else if (ev.data?.type === 'VAD_SPEECH_START') {
+                    if (now - lastLogTime === 0) console.log('[sttWorker/onmessage] Handling VAD_SPEECH_START (throttled)...'); // Log details only when throttled log is printed
+                    try { self.send({ type: 'VAD_SPEECH_START' }); } catch (e) { /* ignore error if actor stopped */ }
+                } else if (ev.data?.type === 'VAD_SILENCE_START') {
+                    if (now - lastLogTime === 0) console.log('[sttWorker/onmessage] Handling VAD_SILENCE_START (throttled)...'); // Log details only when throttled log is printed
+                    try { self.send({ type: 'VAD_SILENCE_START' }); } catch (e) { /* ignore error if actor stopped */ }
+                }
+                // Ignore ArrayBuffer chunks silently
+                else if (!(ev.data instanceof ArrayBuffer)) {
+                    console.warn('[sttWorker] Unknown message type from worklet:', ev.data);
+                }
+            };
+            context.audioWorkletNode.port.onmessageerror = (ev) => {
+                console.error('[sttWorker] Audio worklet port message error:', ev);
+                self.send({ type: 'WORKLET_ERROR', error: 'Audio worklet port message error' });
+            };
+            context.audioWorkletNode.onprocessorerror = (ev) => {
+                console.error('[sttWorker] Audio worklet processor error:', ev);
+                self.send({ type: 'WORKLET_ERROR', error: `Audio worklet processor error: ${ev}` });
+            };
+            console.log('[sttWorker/Action] Worklet message handlers assigned.');
+        },
+        // --- New Action to Remove Listeners ---
+        removeWorkletListeners: ({ context }) => {
+            console.log('[sttWorker/Action] Removing worklet message listeners...');
+            if (context.audioWorkletNode?.port) {
+                try {
+                    // 1. Send stop message to worklet first
+                    console.log('[sttWorker/Action] Sending stop message to worklet before removing listeners.');
+                    context.audioWorkletNode.port.postMessage({ type: 'stop' });
+                } catch (e) {
+                    console.warn('[sttWorker/Action] Error sending stop message to worklet:', e);
+                    // Continue even if sending stop fails, try to remove listeners anyway
+                }
+                try {
+                    // Set handlers to null to stop processing messages
+                    context.audioWorkletNode.port.onmessage = null;
+                    context.audioWorkletNode.port.onmessageerror = null;
+                    console.log('[sttWorker/Action] Worklet message listeners removed.');
+                } catch (e) {
+                    // Log error but continue, as cleanup should proceed
+                    console.warn('[sttWorker/Action] Error removing worklet listeners:', e);
+                }
+            } else {
+                console.log('[sttWorker/Action] No audioWorkletNode or port found, skipping listener removal.');
+            }
+        },
+        // --- New Action to Mark as Stopping ---
+        markAsStopping: assign({ isStopping: true }),
     },
     guards: {
         hasAudioChunks: ({ context }) => context.audioChunks.length > 0,
-        // hasTranscribeFn removed (required input)
-        // hasToken removed (required input)
         // Correct event type comparisons using 'xstate.' prefix
         isMediaRecorder: ({event}) => event.type === 'xstate.done.actor.initializeRecorderActor' && event.output instanceof MediaRecorder,
-        isNotMediaRecorder: ({event}) => event.type === 'xstate.done.actor.initializeRecorderActor' && !(event.output instanceof MediaRecorder)
+        isNotMediaRecorder: ({event}) => event.type === 'xstate.done.actor.initializeRecorderActor' && !(event.output instanceof MediaRecorder),
+        isWorkletSetupSuccess: ({event}) => event.type === 'xstate.done.actor.audioWorkletSetupActor' && !!event.output?.audioContext,
     }
 }).createMachine({
     id: 'sttWorker', // Changed ID for clarity
-    // context initialized with required input fields
     context: ({ input }) => ({
-        parent: input.parent, // Store parent ref if needed for direct communication (though sendParent is preferred)
+        parent: input.parent,
         audioStream: input.audioStream,
         mediaRecorder: null,
         audioChunks: [],
-        // transcribedText: null, // Remove from context
         errorMessage: null,
         minDecibels: input.minDecibels,
         silenceDuration: input.silenceDuration,
         transcribeFn: input.transcribeFn,
         apiToken: input.apiToken,
         rmsLevel: 0,
+        audioContext: null,
+        sourceNode: null,
+        audioWorkletNode: null,
+        isWorkletReady: false,
+        isStopping: false, // Initialize the new flag
     }),
-    // Initial state is now initializing
-    initial: 'initializing',
+    // Initial state sequence: recorder -> worklet
+    initial: 'initializingRecorder',
     states: {
-        // idle state removed
-        // permissionPending state removed
-        initializing: {
-            entry: log('[sttWorker] Entering initializing state...'),
+        initializingRecorder: {
+            entry: log('[sttWorker] Entering initializingRecorder state...'),
             invoke: {
                 id: 'initializeRecorderActor',
                 src: 'initializeRecorderActor',
                 input: ({ context }) => ({ stream: context.audioStream }),
                 onDone: {
-                    target: 'listening',
+                    target: 'initializingWorklet',
                     actions: [
-                        { type: 'assignRecorder' },
-                        { type: 'setupRecorderListeners' },
-                        log('[sttWorker] Recorder initialized, moving to listening.')
+                        'assignRecorder', // Use string action name
+                        'setupRecorderListeners', // Use string action name
+                        log('[sttWorker] Recorder initialized, moving to init worklet.')
                     ]
                 },
                 onError: {
                     target: 'stopped',
-                    actions: [{ type: 'assignError' }, 'sendErrorToParent', log('[sttWorker] Recorder initialization failed.')]
+                    actions: ['assignError', 'sendErrorToParent', log('[sttWorker] Recorder initialization failed.')]
                 }
             },
             on: {
-                // Allow stopping during initialization
-                STOP: { target: 'stopped', actions: log('[sttWorker] Received STOP during initialization.') }
+                STOP: { target: 'stopped', actions: log('[sttWorker] Received STOP during recorder initialization.') }
+            }
+        },
+        initializingWorklet: {
+            entry: log('[sttWorker] Entering initializingWorklet state...'),
+            invoke: {
+                id: 'audioWorkletSetupActor',
+                src: 'audioWorkletSetupActor',
+                onDone: {
+                    target: 'listening',
+                    guard: 'isWorkletSetupSuccess',
+                    actions: [
+                        'assignAudioContextAndWorkletReady', // 1. Assign context and ready flag
+                        'setupAndStartAudioProcessing',     // 2. Create nodes, connect, start worklet, assign node to context
+                        'setupWorkletMessageHandler',       // 3. Assign message handlers to the node in context
+                        log('[sttWorker] AudioWorklet setup success, moving to listening.')
+                    ]
+                },
+                onError: {
+                    target: 'stopped',
+                    actions: [
+                        'markAsStopping',
+                        log('[sttWorker/InvokeError] !!! onError in initializingWorklet (audioWorkletSetupActor) !!!'),
+                        'assignWorkletError',
+                        'sendErrorToParent'
+                    ]
+                }
+            },
+            on: {
+                STOP: { target: 'stopped', actions: ['closeAudioContext', 'clearAudioNodes', log('[sttWorker] Received STOP during worklet initialization.')] } // Cleanup audio context if stopped here
             }
         },
         listening: {
             id: 'listeningState',
             entry: [
-                log('[sttWorker] Entering listening state...'),
-                // 'clearError' // Error cleared on successful init
+                log('[sttWorker] Entering listening state (Worklet running)...'),
             ],
-            invoke: {
-                 id: 'audioAnalysisService',
-                 src: 'audioAnalysisService',
-                 input: ({context}) => ({
-                     stream: context.audioStream, // Use stream from context
-                     minDecibels: context.minDecibels,
-                     silenceDuration: context.silenceDuration
-                 }),
-                  // Handle errors from the analysis service itself?
-                  onError: {
-                      target: 'stopped',
-                      actions: [
-                          assign({errorMessage: 'Audio analysis service failed'}), // Generic error
-                          'sendErrorToParent',
-                          log('[sttWorker] Audio Analysis Service error.')
-                      ]
-                  }
-             },
+            // No invoke needed, worklet runs
             on: {
-                SOUND_DETECTED: {
+                VAD_SPEECH_START: { // From worklet
                      target: 'recording',
-                     actions: log('[sttWorker] SOUND_DETECTED event received.')
+                     actions: log('[sttWorker] VAD_SPEECH_START event received.')
                  },
-                 _AUDIO_ANALYSIS_UPDATE: {
-                     actions: 'assignAnalysisUpdate'
+                 WORKLET_RMS_UPDATE: { // From worklet
+                     actions: ['assignRmsLevel', 'sendRmsUpdateToParent', /* Optional: Throttled log here */ ] // Use string name, send update to parent
                  },
-                 // Stop command from manager
-                 STOP: { target: 'stopped', actions: log('[sttWorker] Received STOP during listening.') }
+                 WORKLET_ERROR: { // From worklet or setup
+                    target: 'stopped',
+                    actions: [
+                        'markAsStopping',
+                        log('[sttWorker/Event] !!! WORKLET_ERROR received in listening state !!!'),
+                        'assignWorkletError',
+                        'sendErrorToParent'
+                    ]
+                 },
+                 STOP: { 
+                    target: 'stopped',
+                    actions: [
+                        'markAsStopping',
+                        'removeWorkletListeners',
+                        log('[sttWorker/Event] !!! STOP received in listening state !!!')
+                    ]
+                }
             },
-            // exit: log('[sttWorker] Exiting listening state.') // analysis service stopped implicitly
+            exit: [log('[sttWorker/State] !!! Exiting listening state !!!')]
         },
         recording: {
             id: 'recordingState',
             entry: [
-                log('[sttWorker] Entering recording state...'),
-                'startRecorder' // Start recorder assumes listeners are set up
+                log('[sttWorker] Entering recording state (Worklet running)...'),
+                'startRecorder' // Start MediaRecorder
             ],
-             invoke: { // Keep analysis running
-                 id: 'audioAnalysisService',
-                 src: 'audioAnalysisService',
-                 input: ({context}) => ({
-                     stream: context.audioStream,
-                     minDecibels: context.minDecibels,
-                     silenceDuration: context.silenceDuration
-                 }),
-                  onError: { // Handle analysis errors during recording too
-                      target: 'stopped',
-                      actions: [
-                          assign({errorMessage: 'Audio analysis service failed during recording'}),
-                          'sendErrorToParent',
-                          log('[sttWorker] Audio Analysis Service error during recording.')
-                      ]
-                  }
-             },
+             // No invoke needed, worklet runs
             on: {
-                // Event sent internally from setupRecorderListeners
                 RECORDING_DATA_AVAILABLE: { actions: 'appendAudioChunk' },
-                SILENCE_DETECTED: {
-                    target: 'waitingForProcessing', // Go to new state
+                VAD_SILENCE_START: { // From worklet
+                    target: 'waitingForProcessing',
                     guard: 'hasAudioChunks',
-                    // Send event to parent INSTEAD of transitioning directly
                     actions: [
-                        log('[sttWorker] SILENCE_DETECTED received in recording state. Sending event to parent...'),
-                        'sendSilenceToParent'
+                        log('[sttWorker] VAD_SILENCE_START received. Sending event to parent...'),
+                        'sendSilenceToParent' // Use string name
                     ]
                 },
-                _AUDIO_ANALYSIS_UPDATE: {
-                    actions: 'assignAnalysisUpdate'
+                WORKLET_RMS_UPDATE: { // From worklet
+                    actions: ['assignRmsLevel', 'sendRmsUpdateToParent', /* Optional: Throttled log here */ ] // Use string name, send update to parent
                 },
-                // Stop command from manager
+                 WORKLET_ERROR: { // From worklet
+                    target: 'stopped',
+                    actions: [
+                        'markAsStopping',
+                        'assignWorkletError',
+                        'sendErrorToParent',
+                        log('[sttWorker] Worklet error received during recording.')
+                    ]
+                 },
                 STOP: {
-                    target: 'stopped', // Stop immediately if told to
-                    actions: ['stopRecorder', log('[sttWorker] Received STOP during recording.')]
+                    target: 'stopped',
+                    actions: [
+                        'markAsStopping',
+                        'removeWorkletListeners',
+                        log('[sttWorker] Received STOP during recording.')
+                    ]
                 }
             },
-            exit: ['stopRecorder', log('[sttWorker] Exiting recording state.')] // Stop recorder when leaving
+            // Stop recorder and worklet processing on exit
+            exit: ['stopRecorder', 'stopAudioProcessing', log('[sttWorker] Exiting recording state.')]
         },
-        // New state to wait for manager's instruction
         waitingForProcessing: {
              id: 'waitingState',
-             entry: log('[sttWorker] Entering waitingForProcessing state...'),
+             entry: log('[sttWorker] Entering waitingForProcessing state (Worklet may still run? Needs clarification)...'),
+             // Worklet might still be running here to detect next speech start?
+             // Or should it be stopped on VAD_SILENCE_START?
+             // For now, assume it stops on exit from recording.
              on: {
                  PROCESS_CHUNKS: {
                      target: 'processing',
-                     // Guard shouldn't be needed here if SILENCE_DETECTED guard worked
-                     actions: log('[sttWorker] SUCCESS: Received PROCESS_CHUNKS in waiting state, moving to processing.')
+                     actions: log('[sttWorker] Received PROCESS_CHUNKS, moving to processing.')
                  },
-                 // Also handle STOP while waiting
                  STOP: {
                       target: 'stopped',
-                      actions: log('[sttWorker] Received STOP while waiting for processing.')
+                      actions: [
+                          'markAsStopping',
+                          'removeWorkletListeners',
+                          log('[sttWorker] Received STOP while waiting for processing.')
+                      ]
                   }
+                 // Need to handle WORKLET_ERROR here too?
              },
-             // Exit actions if needed? Recorder should already be stopped from recording exit.
+             // No exit action needed?
         },
         processing: {
              id: 'processingState',
-            // Clear chunks just before invoking actor
-            entry: [log('[sttWorker] Entering processing state...')],
+            entry: [log('[sttWorker] Entering processing state (Worklet stopped)...')],
             invoke: {
                 id: 'transcriptionActor',
                 src: 'transcriptionActor',
-                // Pass required context items
                 input: ({ context }) => ({
-                    chunks: context.audioChunks, // Chunks should be available here
+                    chunks: context.audioChunks,
                     transcribeFn: context.transcribeFn,
                     token: context.apiToken
                 }),
                 onDone: {
-                    target: 'stopped', // Worker is done after successful transcription
+                    target: 'stopped', // Go to final state
                     actions: [
-                        'stopRecorder',
                         'clearAudioChunks',
                         'sendResultToParent',
-                        log('[sttWorker] Transcription successful, stopping and cleaning up recorder.')
+                        log('[sttWorker] Transcription successful, stopping worker.')
                     ]
                 },
                 onError: {
-                    target: 'stopped', // Worker stops on transcription error
+                    target: 'stopped', // Go to final state
                     actions: [
-                        'stopRecorder',
+                        'markAsStopping',
                         'clearAudioChunks',
                         'assignError',
                         'sendErrorToParent',
-                        log('[sttWorker] Transcription failed, stopping and cleaning up recorder.')
+                        log('[sttWorker] Transcription failed, stopping worker.')
                     ]
                 }
             },
-            // Remove always guard (manager responsibility)
             on: {
-                 // Handle STOP event during processing? Maybe just let it finish?
-                 // For simplicity, let's assume it finishes or errors out.
-                 // If immediate stop is needed, we'd need cancellation logic.
                  STOP: {
+                     // Maybe allow stopping transcription actor? Needs cancellation.
+                     // For now, log and let it finish.
                      actions: log('[sttWorker] Received STOP during processing (ignored, will finish/error out).')
                  }
             }
         },
-        // transcribed state removed
-        // error state removed
-
-        // Final state for the worker
         stopped: {
             type: 'final',
-            entry: log('[sttWorker] Entering final stopped state.')
-            // Cleanup actions like stopping recorder/analysis are handled in exit actions of previous states or manager stops the actor.
+            entry: [ // Add cleanup on final entry
+                'markAsStopping', // Ensure flag is set on final entry too
+                'removeWorkletListeners', // Ensure listeners are removed first
+                log('[sttWorker] Entering final stopped state.'),
+                'stopRecorder', // Ensure recorder is stopped
+                'stopAudioProcessing', // Ensure worklet processing is stopped (now removes listeners too)
+                'closeAudioContext', // Close the audio context
+                'clearAudioNodes', // Clear context refs
+            ]
         }
     }
 });

@@ -67,6 +67,7 @@ type SttManagerEvent =
 	| { type: 'error.platform.micPermissionActor'; error: unknown }
 	| { type: 'WORKER_SILENCE_DETECTED'; workerRef: ActorRefFrom<typeof sttMachine> }
 	| { type: 'WORKER_TRANSCRIPTION_RESULT'; text: string; workerRef: ActorRefFrom<typeof sttMachine> }
+	| { type: 'WORKER_RMS_UPDATE'; value: number; workerRef: ActorRefFrom<typeof sttMachine> }
 	| { type: 'WORKER_ERROR'; error: string; workerRef: ActorRefFrom<typeof sttMachine> };
 
 // Type predicate functions for events
@@ -190,6 +191,7 @@ export const sttManagerMachine = setup({
 		}),
 		assignPermissionDeniedError: assign({ errorMessage: 'Microphone permission denied.' }),
 		stopAllWorkersAction: ({ context }: { context: SttManagerContext }) => {
+			console.warn('[/ActiosttManagern] !!! stopAllWorkersAction called !!!');
 			const workersToStop: ActorRefFrom<typeof sttMachine>[] = [];
 			if (context.activeWorker) {
 				workersToStop.push(context.activeWorker); // No cast needed now
@@ -325,6 +327,27 @@ export const sttManagerMachine = setup({
 			statusMessage: 'Idle',
 			rmsLevel: 0,
 		}),
+		// Action to send RMS update to parent (Configurator)
+		sendRmsUpdateToParent: sendParent(({ event }) => {
+			// Type guard
+			if (event.type === 'WORKER_RMS_UPDATE') {
+				// Optional: Log the RMS being forwarded
+				// console.log(`[sttManager] Forwarding MANAGER_RMS_UPDATE: ${event.value.toFixed(4)}`);
+				return { type: 'MANAGER_RMS_UPDATE', value: event.value };
+			}
+			// Should not happen
+			console.warn('[sttManager] sendRmsUpdateToParent called with wrong event type:', event.type);
+			return undefined;
+		}),
+		// Maybe update manager's internal RMS too?
+		assignRmsLevel: assign({
+			rmsLevel: ({ event, context }) => {
+				if (event.type === 'WORKER_RMS_UPDATE') {
+					return event.value;
+				}
+				return context.rmsLevel; // Keep existing if wrong event
+			}
+		}),
 	},
 	guards: {
 		hasActiveStream: ({ context }) => !!context.managerAudioStream && context.managerAudioStream.active,
@@ -415,7 +438,8 @@ export const sttManagerMachine = setup({
 			always: [
 				{
 					target: 'error',
-					guard: ({ context }) => (!context.managerAudioStream || !context.managerAudioStream.active) || !context.activeWorker || !context.apiToken || !context.transcribeFn,
+					// Temporarily remove the !context.activeWorker check to test timing hypothesis
+					guard: ({ context }) => (!context.managerAudioStream || !context.managerAudioStream.active)  || !context.activeWorker  || !context.apiToken || !context.transcribeFn,
 					actions: assign({ errorMessage: 'Failed to initialize managing state: Invalid stream, worker spawn failed, or missing config.' })
 				}
 			],
@@ -450,6 +474,10 @@ export const sttManagerMachine = setup({
 						log('[sttManager] Processed transcription result and notified parent.')
 					]
 				},
+				WORKER_RMS_UPDATE: {
+					// Update manager context AND forward to configurator
+					actions: ['assignRmsLevel', 'sendRmsUpdateToParent']
+				},
 				WORKER_ERROR: {
 					target: 'error',
 					actions: [
@@ -466,6 +494,7 @@ export const sttManagerMachine = setup({
 			},
 			exit: [
 				'cleanupStream',
+				log('[sttManager/State] Executing stopAllWorkersAction in exit handler of managing state.'),
 				'stopAllWorkersAction',
 				'assignStoppedWorkers'
 			]
@@ -473,6 +502,8 @@ export const sttManagerMachine = setup({
 		error: {
 			entry: [
 				log( ({context}) => `[SttManager] Entering error state: ${context.errorMessage}`),
+				log('[sttManager/State] Executing cleanup actions in entry handler of error state.'),
+				'sendErrorToParent',
 				'cleanupStream',
 				'stopAllWorkersAction',
 				'assignStoppedWorkers'

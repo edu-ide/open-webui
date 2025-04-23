@@ -52,7 +52,8 @@ export type SttConfiguratorEvent =
 	| { type: 'STOP_CALL' } // Forwarded to applicable actors
 	// Events received FROM spawned actors
 	| { type: 'WORKER_STATE_UPDATE'; state: any } // Keep 'any' for now, or create a union type
-	| { type: 'MANAGER_TRANSCRIPTION_UPDATE'; finalTranscript: string }
+	| { type: 'MANAGER_TRANSCRIPTION_UPDATE'; finalTranscript: string | null } // Can be null
+	| { type: 'MANAGER_RMS_UPDATE'; value: number }
 	| { type: 'WORKER_ERROR'; error: string }
 	| { type: 'error.actor.manager' }; // Generic actor error
 
@@ -219,12 +220,6 @@ export const sttConfiguratorMachine = setup({
 		logSpawn: log('[Configurator] Entering active state, attempting to spawn actor...'),
 		// Assign state received from ANY worker/manager
 		assignWorkerState: assign({
-			workerIsListening: ({ context, event }) => {
-				if (event.type === 'WORKER_STATE_UPDATE' && typeof event.state?.isListening === 'boolean') {
-					return event.state.isListening;
-				}
-				return context.workerIsListening;
-			},
 			workerError: ({ context, event }) => {
 				if (event.type === 'WORKER_STATE_UPDATE') {
 					// Check if error is null or a string
@@ -237,7 +232,9 @@ export const sttConfiguratorMachine = setup({
 			},
 			workerCurrentTranscript: ({ context, event }) => {
 				if (event.type === 'WORKER_STATE_UPDATE') {
-					return typeof event.state?.currentTranscript === 'string' || event.state?.currentTranscript === null ? event.state.currentTranscript : context.workerCurrentTranscript;
+					const currentTranscript = typeof event.state?.currentTranscript === 'string' || event.state?.currentTranscript === null ? event.state.currentTranscript : context.workerCurrentTranscript;
+					// console.log(`[Configurator/AssignState] Updating currentTranscript: ${currentTranscript}`); // Verbose log, enable if needed
+					return currentTranscript;
 				}
 				return context.workerCurrentTranscript;
 			},
@@ -248,12 +245,14 @@ export const sttConfiguratorMachine = setup({
 					const finalTranscript = event.state?.finalTranscript;
 					// Assign if it's a string or null, otherwise keep existing
 					if (typeof finalTranscript === 'string' || finalTranscript === null) {
+						console.log(`[Configurator/AssignState] Updating finalTranscript from WORKER_STATE_UPDATE: ${finalTranscript}`); // Added log
 						return finalTranscript;
 					}
 				}
 				// Handle direct update event (e.g., from Whisper Manager/Live)
 				if (event.type === 'MANAGER_TRANSCRIPTION_UPDATE') {
 					// Directly assign the value (can be string or null)
+					console.log(`[Configurator/AssignState] Updating finalTranscript from MANAGER_TRANSCRIPTION_UPDATE: ${event.finalTranscript}`); // Added log
 					return event.finalTranscript;
 				}
 				// Keep existing value if no relevant update
@@ -262,6 +261,9 @@ export const sttConfiguratorMachine = setup({
 			workerRmsLevel: ({ context, event }) => {
 				if (event.type === 'WORKER_STATE_UPDATE' && typeof event.state?.rmsLevel === 'number') {
 					return event.state.rmsLevel;
+				}
+				if (event.type === 'MANAGER_RMS_UPDATE') {
+					return event.value;
 				}
 				return context.workerRmsLevel; // Keep existing if not updated
 			}
@@ -305,6 +307,8 @@ export const sttConfiguratorMachine = setup({
 				}
 			}
 		),
+		// Action to explicitly set listening state
+		setListening: assign({ workerIsListening: ({ event }, params: { value: boolean }) => params.value }),
 	},
 	guards: {
 		hasActorRef: ({ context }) => context.managerRef !== null, // Renamed from hasManagerRef
@@ -342,9 +346,10 @@ export const sttConfiguratorMachine = setup({
 			entry: [
 				log('[Configurator] Entering active state, attempting to spawn actor...'),
 				'spawnActor',
-				'sendStartCommandToActor' // Send the appropriate start command based on engine
+				'sendStartCommandToActor', // Send the appropriate start command based on engine
+				{ type: 'setListening', params: { value: true } } // Assume listening starts
 			] as const,
-			exit: ['stopActor', log('[Configurator] Exiting active state, stopping actor.')] as const,
+			exit: ['stopActor', { type: 'setListening', params: { value: false } }, log('[Configurator] Exiting active state, stopping actor.')] as const,
 			on: {
 				STOP_SESSION: { target: 'idle' },
 				CONFIG_UPDATE: {
@@ -354,8 +359,15 @@ export const sttConfiguratorMachine = setup({
 				// Handle updates FROM the worker/manager
 				WORKER_STATE_UPDATE: { actions: 'assignWorkerState' },
 				MANAGER_TRANSCRIPTION_UPDATE: { actions: 'assignWorkerState' }, // Use same action
-				WORKER_ERROR: { target: 'error', actions: 'assignWorkerState' }, // Assign error message from event
-				'error.actor.manager': { target: 'error', actions: [assign({ errorMessage: 'Actor terminated unexpectedly.' }), 'clearWorkerState'] }, // Handle generic actor error
+				MANAGER_RMS_UPDATE: { actions: 'assignWorkerState' },
+				WORKER_ERROR: { 
+					target: 'error', 
+					actions: [{ type: 'setListening', params: { value: false } }, 'assignWorkerState']
+				}, 
+				'error.actor.manager': { 
+					target: 'error', 
+					actions: [{ type: 'setListening', params: { value: false } }, assign({ workerError: 'Actor terminated unexpectedly.' }), 'clearWorkerState'] 
+				}, 
 
 				// Forward commands TO the worker/manager
 				'*': {
@@ -365,7 +377,11 @@ export const sttConfiguratorMachine = setup({
 			},
 		},
 		error: {
-			entry: [log('[Configurator] Entering error state.'), 'clearWorkerState'],
+			entry: [
+				log('[Configurator] Entering error state.'), 
+				{ type: 'setListening', params: { value: false } }, // Ensure listening is false on error
+				'clearWorkerState'
+			],
 			on: {
 				// Allow retry by restarting the session
 				START_SESSION: { target: 'active', actions: 'assignConfig' },

@@ -210,13 +210,22 @@ const websocketActorLogic = fromCallback<WhisperLiveEvent, { url: string, parent
             console.log(`[WebSocketActor/${input.parentMachineId}] Received command from parent: STOP_LISTENING`);
 			if (socket && socket.readyState === WebSocket.OPEN) socket.close(1000, 'Client stopped');
 		} else if (event.type === 'WORKLET_AUDIO_CHUNK') { // Handle audio chunk event from parent
+			console.log(`[WebSocketActor/${input.parentMachineId}] Received WORKLET_AUDIO_CHUNK from machine.`);
+			if (socket) {
+			    console.log(`[WebSocketActor/${input.parentMachineId}] Checking socket state before send: readyState = ${socket.readyState} (1 = OPEN)`);
+			} else {
+			    console.error(`[WebSocketActor/${input.parentMachineId}] Cannot send audio chunk: socket is null!`);
+			    return; // 소켓이 없으면 더 이상 진행하지 않음
+			}
 			if (socket && socket.readyState === WebSocket.OPEN) {
 				try {
-                    socket.send(event.data);
-                }
+					console.log(`[WebSocketActor/${input.parentMachineId}] Attempting to send ${event.data.byteLength} bytes of audio data. Socket state: ${socket.readyState}`);
+					socket.send(event.data);
+				}
 				catch (e: any) {
+					console.error(`[WebSocketActor/${input.parentMachineId}] Error during socket.send:`, e);
 					const message = e instanceof Error ? e.message : 'Unknown error';
-                    console.error(`[WebSocketActor/${input.parentMachineId}] Error sending audio chunk:`, message, e);
+					console.error(`[WebSocketActor/${input.parentMachineId}] Error sending audio chunk:`, message, e);
 					sendBack({ type: 'WEBSOCKET.ERROR', error: `Send audio failed: ${message}` } as any);
 				}
 			}
@@ -361,6 +370,7 @@ export const whisperLiveSttMachine = setup({
 			if (event.type !== 'WEBSOCKET.MESSAGE') return {};
             let data;
             try {
+                console.log('[WhisperLive/WS Msg Received]:', event.data); // Log raw incoming message
                 data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
             } catch (e) {
                 console.error("[WhisperLive] Failed to parse WS message data:", event.data, e);
@@ -370,11 +380,16 @@ export const whisperLiveSttMachine = setup({
 			let updates: Partial<Pick<WhisperLiveContext, 'currentSegment' | 'finalTranscriptBuffer' | 'errorMessage'>> = {};
             // Restore simpler logic - assign values based on message
 
+			let isFinalUpdate = false;
+			let updateSource = 'unknown';
+
 			// Adapt to common whisper.cpp/faster-whisper streaming JSON structures
 			if (data?.segments && Array.isArray(data.segments)) {
+				 updateSource = 'segments';
 				 const transcript = data.segments.map((s: any) => s.text || '').join(' ').trim();
 				 const lastSegment = data.segments[data.segments.length - 1];
 				 const isFinal = lastSegment?.final === true || lastSegment?.type === 'final' || lastSegment?.completed === true || lastSegment?.segment_type === 'final';
+				 isFinalUpdate = isFinal;
 
 				 updates.currentSegment = transcript;
 				 if (isFinal) {
@@ -382,20 +397,30 @@ export const whisperLiveSttMachine = setup({
 				 }
                  if (context.errorMessage !== null) updates.errorMessage = null;
 			} else if (data?.transcript && typeof data.transcript === 'string') {
+                updateSource = 'transcript_field';
                 updates.currentSegment = data.transcript;
                 if (data.final === true) {
+                    isFinalUpdate = true;
                     updates.finalTranscriptBuffer = data.transcript.trim() || null;
                 }
                 if (context.errorMessage !== null) updates.errorMessage = null;
             } else if (data?.type === 'partial_transcript' && data.data) {
+                updateSource = 'partial_transcript_event';
                 updates.currentSegment = data.data;
                 if (context.errorMessage !== null) updates.errorMessage = null;
             } else if (data?.type === 'final_transcript' && data.data) {
+                updateSource = 'final_transcript_event';
+                isFinalUpdate = true;
                 updates.currentSegment = null; // Clear partial on final
                 const newFinal = (context.finalTranscriptBuffer || '') + data.data + ' ';
                 updates.finalTranscriptBuffer = newFinal.trim() || null;
                 if (context.errorMessage !== null) updates.errorMessage = null;
             }
+
+			// Log the update details
+			if (updateSource !== 'unknown') {
+			    console.log(`[WhisperLive/AssignUpdate] Source: ${updateSource}, Final: ${isFinalUpdate}, Current: "${updates.currentSegment ?? ''}", FinalBuffer: "${updates.finalTranscriptBuffer ?? ''}"`);
+			}
 
 			return updates; // Return context changes
 		}),
@@ -424,20 +449,26 @@ export const whisperLiveSttMachine = setup({
 			isAudioProcessing: false, // Reset audio processing flag
 		}),
         // Renamed from clearContext for clarity
-		clearDynamicContext: assign({
-			websocketActor: null,
-			sourceNode: null,
-			audioWorkletNode: null,
-			mediaStream: null,
-			audioContext: null,
-			isWorkletReady: false,
-			isAudioProcessing: false,
-			connectionStatus: 'idle' as const,
-			isServerReady: false,
-			currentSegment: null,
-			finalTranscriptBuffer: null,
-			errorMessage: null,
-			rmsLevel: 0, // Reset RMS level
+		clearDynamicContext: assign(( { context } ) => { // Use object destructuring to get context
+			console.warn('[WhisperLive/Context] WARNING: Executing clearDynamicContext. This should not happen during active streaming.', { 
+				// Note: context.value is not available directly here. Logging connectionStatus instead.
+				connectionStatus: context.connectionStatus 
+			}); 
+			return {
+				websocketActor: null,
+				sourceNode: null,
+				audioWorkletNode: null,
+				mediaStream: null,
+				audioContext: null,
+				isWorkletReady: false,
+				isAudioProcessing: false,
+				connectionStatus: 'idle' as const,
+				isServerReady: false,
+				currentSegment: null,
+				finalTranscriptBuffer: null,
+				errorMessage: null,
+				rmsLevel: 0, // Reset RMS level
+			}
 		}),
 
 
@@ -496,18 +527,36 @@ export const whisperLiveSttMachine = setup({
 				audioWorkletNode = new AudioWorkletNode(context.audioContext, 'audio-processor');
                 console.log('[WhisperLive] setupAndStartAudioProcessing: AudioWorkletNode created.');
 
-				audioWorkletNode.port.onmessage = (ev: MessageEvent) => { // Accept any message type for now
+					audioWorkletNode.port.onmessage = (ev: MessageEvent) => { // Accept any message type for now
+					    // <<< 추가: 액터/노드가 정리 중인지 확인 >>>
+					    if (!context.audioWorkletNode) {
+					        // console.log('[WhisperLive/WorkletMsg] audioWorkletNode is null in context, ignoring message.'); // 로그는 필요시 활성화
+					        return; // 노드가 null이면 (정리 중이면) 메시지 무시
+					    }
+					    // <<< ------------------------------------ >>>
+
                     // Check message type before sending to self
                     if (ev.data?.type === 'RMS_UPDATE') {
+                        console.log(`[WhisperLive/WorkletMsg] Received RMS_UPDATE: ${ev.data.value}`);
                         self.send({ type: 'WORKLET_RMS_UPDATE', value: ev.data.value });
                     } else if (ev.data?.type === 'VAD_SPEECH_START') { // Handle VAD events
                         self.send({ type: 'VAD_SPEECH_START' });
                     } else if (ev.data?.type === 'VAD_SILENCE_START') {
                         self.send({ type: 'VAD_SILENCE_START' });
                     } else if (ev.data instanceof ArrayBuffer) { // Check if data is ArrayBuffer
-					    self.send({ type: 'WORKLET_AUDIO_CHUNK', data: ev.data });
+					    console.log('[WhisperLive/WorkletMsg] Data is ArrayBuffer. Attempting self.send...');
+					    try {
+					        self.send({ type: 'WORKLET_AUDIO_CHUNK', data: ev.data });
+					        console.log('[WhisperLive/WorkletMsg] self.send(WORKLET_AUDIO_CHUNK) called successfully.');
+					    } catch (e) {
+					        console.error('[WhisperLive/WorkletMsg] Error during self.send(WORKLET_AUDIO_CHUNK):', e);
+					    }
                     } else {
-                        console.warn('[WhisperLive] Unknown message type from worklet:', ev.data);
+                        console.warn('[WhisperLive/WorkletMsg] Unexpected message format from worklet. Expected ArrayBuffer for audio chunk. Received:', 
+                            `Type: ${typeof ev.data}`, 
+                            `Instance of ArrayBuffer: ${ev.data instanceof ArrayBuffer}`, 
+                            `Data:`, ev.data // Log the actual data
+                        );
                     }
 				};
                 // Use onmessageerror instead of onerror for port errors
@@ -529,6 +578,7 @@ export const whisperLiveSttMachine = setup({
 				// audioWorkletNode.connect(context.audioContext.destination);
 
 				// Tell the worklet to start processing AFTER connecting the graph
+                console.log(`[WhisperLive/AudioSetup] Nodes connected. WorkletNode exists: ${!!audioWorkletNode}, Port exists: ${!!audioWorkletNode?.port}`);
                 console.log('[WhisperLive] setupAndStartAudioProcessing: Sending start message to worklet...');
 				audioWorkletNode.port.postMessage({ type: 'start' });
 				console.log('[WhisperLive] Audio graph connected & worklet start message sent.');
@@ -536,7 +586,7 @@ export const whisperLiveSttMachine = setup({
 				return { sourceNode, audioWorkletNode, errorMessage: null, isAudioProcessing: true }; // Set flag here
 
 			} catch (error: any) {
-				console.error('[WhisperLive] setupAndStartAudioProcessing: Error setting up media graph:', error);
+				console.error('[WhisperLive/AudioSetup] CRITICAL: Error during setupAndStartAudioProcessing:', error);
 				self.send({ type: 'WORKLET_ERROR', error: `Audio graph setup failed: ${error instanceof Error ? error.message : 'Unknown'}` });
 				return { sourceNode: null, audioWorkletNode: null, isAudioProcessing: false }; // Clear nodes on error
 			}
@@ -583,6 +633,8 @@ export const whisperLiveSttMachine = setup({
                  console.log('[WhisperLive] stopAllProcessing: stopping websocket actor via stopChild is preferred in transition actions.');
             }
 
+            // --- Removing handlers moved to removeWorkletMessageHandler ---
+
             // Stop Audio Processing
             console.log('[WhisperLive] stopAllProcessing: stopping audio processing...');
             if (context.audioWorkletNode) {
@@ -606,20 +658,40 @@ export const whisperLiveSttMachine = setup({
             }
             console.log('[WhisperLive] stopAllProcessing: Action completed.');
         },
+        // --- New Action to Remove Message Handlers ---
+        removeWorkletMessageHandler: ({ context }) => {
+            console.log('[WhisperLive/Action] Removing worklet message handlers...');
+            if (context.audioWorkletNode?.port) {
+                try {
+                    // Set handlers to null to stop processing messages
+                    context.audioWorkletNode.port.onmessage = null;
+                    context.audioWorkletNode.port.onmessageerror = null;
+                    console.log('[WhisperLive/Action] Worklet message handlers removed.');
+                } catch (e) {
+                    // Log error but continue, as cleanup should proceed
+                    console.warn('[WhisperLive/Action] Error removing worklet message handlers:', e);
+                }
+            } else {
+                console.log('[WhisperLive/Action] No audioWorkletNode or port found, skipping handler removal.');
+            }
+        },
 
 		// --- Parent Communication ---
-		sendStateUpdateToParent: sendParent(({ context }) => ({
-			type: 'WORKER_STATE_UPDATE',
-			state: {
-				isListening: context.isAudioProcessing && context.connectionStatus === 'connected',
-				error: context.errorMessage,
-				currentTranscript: context.currentSegment,
-				finalTranscript: context.finalTranscriptBuffer,
-				connectionStatus: context.connectionStatus,
-				isServerReady: context.isServerReady,
-				rmsLevel: context.rmsLevel
-			}
-		})),
+		sendStateUpdateToParent: sendParent(({ context }) => {
+			console.log(`[WhisperLive/Action] Sending WORKER_STATE_UPDATE to parent. RMS: ${context.rmsLevel}`);
+			return {
+				type: 'WORKER_STATE_UPDATE',
+				state: {
+					isListening: context.isAudioProcessing && context.connectionStatus === 'connected',
+					error: context.errorMessage,
+					currentTranscript: context.currentSegment,
+					finalTranscript: context.finalTranscriptBuffer,
+					connectionStatus: context.connectionStatus,
+					isServerReady: context.isServerReady,
+					rmsLevel: context.rmsLevel
+				}
+			};
+		}),
 		sendFinalizedUpdateToParent: sendParent(({ context, event }) => {
 			// Check if the triggering event was a WS message containing a final transcript
 			if (event.type === 'WEBSOCKET.MESSAGE') {
@@ -672,6 +744,12 @@ export const whisperLiveSttMachine = setup({
                     console.log('[WhisperLive/WS Msg] Server error condition met. Sending WEBSOCKET.ERROR to self.', data.error);
                     self.send({ type: 'WEBSOCKET.ERROR', error: data.error });
                 }
+				// Log transcript segments if they exist (handled by assignTranscriptionUpdate)
+				else if (data?.segments || data?.transcript || data?.type?.includes('transcript')) {
+				    // console.log('[WhisperLive/WS Msg] Transcript data received (handled by assignTranscriptionUpdate).');
+				} else {
+				    console.log('[WhisperLive/WS Msg] Received other message type:', data);
+				}
 			} catch (e) {
 				console.error('[WhisperLive] Error processing parsed WS message logic:', e);
 			}
@@ -680,10 +758,27 @@ export const whisperLiveSttMachine = setup({
 		// --- Logging ---
 		logAudioStreamingStarted: log('[WhisperLive] Audio streaming started.'),
 		logError: log(({ context }) => `[WhisperLive] Error state reached. Message: ${context.errorMessage ?? 'No error message'}`),
-		logReceivedEvent: log(({ event }) => `[WhisperLive] Received event: ${JSON.stringify(event)}`, 'EventLog'),
+		logReceivedEvent: log(({ event }) => {
+			try {
+				// Attempt to stringify, replace ArrayBuffer with placeholder
+				const eventString = JSON.stringify(event, (key, value) => {
+					if (value instanceof ArrayBuffer) {
+						return `[ArrayBuffer: ${value.byteLength} bytes]`;
+					}
+					return value;
+				});
+				return `[WhisperLive/Event] Received: ${eventString}`;
+			} catch (e) {
+				// Fallback for complex/circular events
+				return `[WhisperLive/Event] Received: ${event.type} (Stringify failed)`;
+			}
+		}, 'EventLog'),
 		assignRmsLevel: assign({
 			rmsLevel: ({ event }) => {
-				if (event.type === 'WORKLET_RMS_UPDATE') return event.value;
+				if (event.type === 'WORKLET_RMS_UPDATE') {
+					console.log(`[WhisperLive/Action] assignRmsLevel: Updating RMS to ${event.value}`);
+					return event.value;
+				}
 				return 0;
 			}
 		}),
@@ -726,11 +821,17 @@ export const whisperLiveSttMachine = setup({
 		},
         canTransitionToStreaming: ({ context }) => {
             // Guard checks context properties, assumes this runs when SERVER_READY is received
-            // This guard might no longer be needed if SERVER_READY is handled within connectingWebSocket state
             return context.isWorkletReady; // Check only worklet readiness globally? Or move handling entirely
         },
         canForwardAudio: ({ context }) => {
             const isReady = context.connectionStatus === 'connected' && context.isServerReady;
+            // Re-add log for debugging
+            if (!isReady) {
+                console.log(`[WhisperLive/Guard] canForwardAudio failed: connectionStatus=${context.connectionStatus}, isServerReady=${context.isServerReady}`);
+            } else {
+                // Log success case too, temporarily
+                console.log(`[WhisperLive/Guard] canForwardAudio PASSED: connectionStatus=${context.connectionStatus}, isServerReady=${context.isServerReady}`);
+            }
             return isReady;
         }
 	}
@@ -764,19 +865,19 @@ export const whisperLiveSttMachine = setup({
         '*': { actions: 'logReceivedEvent' },
 		'GLOBAL.RESET': {
 			target: '.idle',
-			actions: ['stopWebSocketActorAction', 'stopAllProcessing', 'clearDynamicContext', 'sendStateUpdateToParent'] as const // Use action name
+			actions: ['removeWorkletMessageHandler', 'stopWebSocketActorAction', 'stopAllProcessing', 'clearDynamicContext', 'sendStateUpdateToParent'] as const // Use action name
 		},
 		'xstate.error.actor.micPermissionActor': {
 			target: '.error',
 			guard: 'isPermissionDeniedError',
-			actions: ['assignPermissionError', 'sendStateUpdateToParent'] as const
+			actions: ['removeWorkletMessageHandler', 'assignPermissionError', 'sendStateUpdateToParent'] as const // Add handler removal
 		},
 		'WORKLET_READY': {
 			actions: ['assignWorkletReady', 'sendStateUpdateToParent'] as const
 		},
 		'WORKLET_ERROR': {
 			target: '.error',
-			actions: ['assignWorkletError', 'stopWebSocketActorAction', 'stopAllProcessing', 'clearDynamicContext', 'sendStateUpdateToParent'] as const // Use action name
+			actions: ['removeWorkletMessageHandler', 'assignWorkletError', 'stopWebSocketActorAction', 'stopAllProcessing', 'clearDynamicContext', 'sendStateUpdateToParent'] as const // Use action name
 		},
 		'WEBSOCKET.OPEN': {
 			actions: [
@@ -787,21 +888,28 @@ export const whisperLiveSttMachine = setup({
 			    'sendStateUpdateToParent'
 			] as const // Ensure the array is treated as a tuple
 		},
-		'WEBSOCKET.CLOSE': {
-            target: '.error',
-            guard: 'isUnexpectedWsClose', // Use simplified guard
-            actions: ['assignConnectionClosed', 'stopAudioProcessing', 'clearAudioNodesAction', 'sendStateUpdateToParent'] as const
-		},
-		'WEBSOCKET.ERROR': {
-			target: '.error',
-            actions: ['assignConnectionError', 'stopAudioProcessing', 'clearAudioNodesAction', 'sendStateUpdateToParent'] as const
-		},
+		'WEBSOCKET.CLOSE': [
+			{ actions: log('[WhisperLive/GlobalOn] WARNING: WEBSOCKET.CLOSE triggered.') },
+			{
+				target: '.error',
+				guard: 'isUnexpectedWsClose',
+				actions: ['removeWorkletMessageHandler', 'assignConnectionClosed', 'stopAudioProcessing', 'clearAudioNodesAction', 'sendStateUpdateToParent'] as const // Add handler removal
+			}
+		],
+		'WEBSOCKET.ERROR': [
+			{ actions: log('[WhisperLive/GlobalOn] WARNING: WEBSOCKET.ERROR triggered.') },
+			{
+				target: '.error',
+				actions: ['removeWorkletMessageHandler', 'assignConnectionError', 'stopAudioProcessing', 'clearAudioNodesAction', 'sendStateUpdateToParent'] as const // Add handler removal
+			}
+		],
 		'WEBSOCKET.MESSAGE': {
-            actions: ['processWebSocketMessage', 'assignTranscriptionUpdate', 'sendStateUpdateToParent', 'sendFinalizedUpdateToParent'] as const
+            actions: ['processWebSocketMessage', 'assignTranscriptionUpdate', 'sendStateUpdateToParent', 'sendFinalizedUpdateToParent', 'checkAndStopWebSocketOnFinal'] as const
 		},
 		'WORKLET_AUDIO_CHUNK': {
-			guard: 'canForwardAudio', // Use the new guard with logging
-			actions: ['forwardAudioToWebsocket'] as const
+			actions: [
+			    log('[WhisperLive/GlobalOn] TEMP: Received WORKLET_AUDIO_CHUNK globally. (Guard and forward removed)')
+			] as const
 		},
         'SERVER_READY': {
             target: '.streamingAudio',
@@ -811,10 +919,13 @@ export const whisperLiveSttMachine = setup({
         'SERVER_WAIT': {
             actions: ['assignServerWait', 'sendStateUpdateToParent', log('[WhisperLive] Received SERVER_WAIT from server.')] as const
         },
-        'SERVER_DISCONNECT': {
-            target: '.error',
-            actions: ['assignServerDisconnect', 'stopWebSocketActorAction', 'stopAudioProcessing', 'clearAudioNodesAction', 'sendStateUpdateToParent'] as const // Use action name
-        },
+        'SERVER_DISCONNECT': [
+			{ actions: log('[WhisperLive/GlobalOn] WARNING: SERVER_DISCONNECT triggered.') },
+			{
+				target: '.error',
+				actions: ['removeWorkletMessageHandler', 'assignServerDisconnect', 'stopWebSocketActorAction', 'stopAudioProcessing', 'clearAudioNodesAction', 'sendStateUpdateToParent'] as const // Add handler removal
+			}
+		],
         'LANGUAGE_DETECTED': {
             actions: ['assignDetectedLanguage', 'sendStateUpdateToParent'] as const
         },
@@ -859,12 +970,14 @@ export const whisperLiveSttMachine = setup({
 				 id: 'micPermissionActor',
 				 src: 'micPermissionActor',
 				 onDone: {
-                    target: 'waitingForSpeech', // Go to waiting state first
-                      actions: [
-                          log('[WhisperLive/Perms] micPermissionActor succeeded.'),
-                          'assignStream',
-                          'setupAndStartAudioProcessing',
-                      ] as const
+					 target: 'connectingWebSocket', // Connect WS immediately after permission
+                       actions: [
+                           log('[WhisperLive/Perms] micPermissionActor succeeded.'),
+                           'assignStream',
+                           'setupAndStartAudioProcessing',
+						    'spawnWebSocketActor',      // Spawn WS actor here
+						    'startWebSocketActor'       // Start WS actor here
+                       ] as const
 				 },
                  onError: {
                      target: 'error',
@@ -880,21 +993,20 @@ export const whisperLiveSttMachine = setup({
 				 actions: log('[WhisperLive] Audio processing not active in waitingForSpeech, re-initializing.')
 			 },
 			 on: {
-				 // VAD_SPEECH_START no longer triggers WS connection here
-				 VAD_SILENCE_START: { // Connect on initial silence detection
+				 VAD_SPEECH_START: { // Reconnect on next speech start
 				     target: 'connectingWebSocket',
-				     actions: log('[WhisperLive] VAD_SILENCE_START received in waiting state, connecting WebSocket...')
+				     actions: [log('[WhisperLive] VAD_SPEECH_START received in waiting state, reconnecting WebSocket...')] as const // Ensure actions is an array
 				 },
-				 STOP_LISTENING: { target: 'stopping' },
+				 STOP_LISTENING: { target: 'stopping', actions: ['removeWorkletMessageHandler'] as const }, // Add handler removal
 				 // WORKLET_ERROR handled globally
 			 }
 		},
 		connectingWebSocket: {
 			 entry: [
 			    log('[WhisperLive] Entering connectingWebSocket state.'),
-			    'spawnWebSocketActor',
-			    'startWebSocketActor',
-			    'sendStateUpdateToParent'
+			    // Spawn/Start actions are now handled in the transition from requestingPermission
+			    // or from waitingForSpeech (if reconnecting)
+			    'sendStateUpdateToParent' // Keep sending state update
 			] as const,
 			 on: {
 				 // VAD_SILENCE_START no longer disconnects WS
@@ -915,7 +1027,7 @@ export const whisperLiveSttMachine = setup({
 			 on: {
 				 // VAD_SILENCE_START no longer disconnects WS
 				 // Consider adding logic here or in worklet to *pause* sending audio on silence if desired
-				 STOP_LISTENING: { target: 'stopping' },
+				 STOP_LISTENING: { target: 'stopping', actions: ['removeWorkletMessageHandler'] as const }, // Add handler removal
 				 'WEBSOCKET.MESSAGE': {
 				     actions: [
 				         'processWebSocketMessage',
@@ -945,6 +1057,7 @@ export const whisperLiveSttMachine = setup({
 		},
 		stopping: {
 			 entry: [
+				 'removeWorkletMessageHandler', // Remove handlers first
 				 log('[WhisperLive] Entering stopping state (STOP_LISTENING received).'),
 				 'stopWebSocketActorAction',
 				 'stopAllProcessing', // Calls actions defined in setup, includes detailed logging
@@ -955,6 +1068,7 @@ export const whisperLiveSttMachine = setup({
 		},
 		error: {
 			entry: [
+				 'removeWorkletMessageHandler', // Remove handlers first
 				 'logError',
 				 'sendErrorToParent',
 				 'stopWebSocketActorAction',

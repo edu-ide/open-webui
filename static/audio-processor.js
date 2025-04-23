@@ -39,27 +39,30 @@ class AudioProcessor extends AudioWorkletProcessor {
     this._isSpeaking = false; // Current VAD state
     this._silenceStartTime = 0; // Timestamp when silence started
 
+    // Throttling trackers for logging
+    this._lastProcessLogTime = 0;
+
     // Listen for messages from the main thread (start/stop recording)
     this.port.onmessage = (event) => {
       if (event.data.type === 'start') {
+        // console.log('[AudioWorklet] Recording started.');
         this._isRecording = true;
         this._lastRmsUpdateTime = currentTime;
         this._isSpeaking = false; // Reset VAD state on start
         this._silenceStartTime = 0;
-        console.log('[AudioWorklet] Recording started.');
       } else if (event.data.type === 'stop') {
+        // console.log(`[AudioWorklet] Received 'stop' message. _isRecording set to: ${this._isRecording}`);
+        // console.log('[AudioWorklet] Recording stopped.');
         this._isRecording = false;
-        console.log(`[AudioWorklet] Received 'stop' message. _isRecording set to: ${this._isRecording}`);
-        console.log('[AudioWorklet] Recording stopped.');
       } else if (event.data.type === 'setTargetSampleRate') {
         this._targetSampleRate = event.data.targetSampleRate;
-        console.log(`[AudioWorklet] Target sample rate set to ${this._targetSampleRate}`);
+        // console.log(`[AudioWorklet] Target sample rate set to ${this._targetSampleRate}`);
       } else if (event.data.type === 'updateVadThreshold') {
           this._vadThreshold = event.data.threshold;
-          console.log(`[AudioWorklet] VAD threshold updated to ${this._vadThreshold}`);
+          // console.log(`[AudioWorklet] VAD threshold updated to ${this._vadThreshold}`);
       } else if (event.data.type === 'updateVadSilenceDuration') {
           this._vadSilenceDuration = event.data.duration;
-          console.log(`[AudioWorklet] VAD silence duration updated to ${this._vadSilenceDuration}`);
+          // console.log(`[AudioWorklet] VAD silence duration updated to ${this._vadSilenceDuration}`);
       }
     };
   }
@@ -89,6 +92,10 @@ class AudioProcessor extends AudioWorkletProcessor {
    * @returns {boolean} - Return true to keep the processor alive.
    */
   process(inputs, outputs, parameters) {
+    // --- Throttled logging for process call ---
+ 
+    // -----------------------------------------
+
     if (!this._isRecording || !inputs || !inputs[0] || !inputs[0][0]) {
       return true; // Keep processor alive
     }
@@ -106,9 +113,9 @@ class AudioProcessor extends AudioWorkletProcessor {
       if (!this._isSpeaking) {
         // Transition: Silence -> Speech
         this._isSpeaking = true;
-        console.log(`[AudioWorklet] VAD: Speech Start (RMS: ${currentRms.toFixed(4)})`);
-        console.log('[AudioWorklet] VAD: Posting VAD_SPEECH_START');
-        this.port.postMessage({ type: 'VAD_SPEECH_START' });
+        // console.log(`[AudioWorklet] VAD: Speech Start (RMS: ${currentRms.toFixed(4)})`);
+        // console.log('[AudioWorklet] VAD: Posting VAD_SPEECH_START');
+        if (this._isRecording) this.port.postMessage({ type: 'VAD_SPEECH_START' });
       }
     } else {
       // Silence detected
@@ -116,7 +123,7 @@ class AudioProcessor extends AudioWorkletProcessor {
         // Transition: Speech -> Silence
         this._isSpeaking = false;
         this._silenceStartTime = nowMs; // Start silence timer
-        console.log(`[AudioWorklet] VAD: Speech End (RMS: ${currentRms.toFixed(4)})`);
+        // console.log(`[AudioWorklet] VAD: Speech End (RMS: ${currentRms.toFixed(4)})`);
         // Optionally send VAD_SPEECH_END event if needed by main thread
         // this.port.postMessage({ type: 'VAD_SPEECH_END' });
       } else if (this._silenceStartTime > 0) {
@@ -124,9 +131,9 @@ class AudioProcessor extends AudioWorkletProcessor {
         const silenceDuration = nowMs - this._silenceStartTime;
         if (silenceDuration >= this._vadSilenceDuration) {
           // Silence duration threshold reached
-          console.log(`[AudioWorklet] VAD: Silence threshold reached (${silenceDuration}ms).`);
-          console.log('[AudioWorklet] VAD: Posting VAD_SILENCE_START');
-          this.port.postMessage({ type: 'VAD_SILENCE_START' });
+          // console.log(`[AudioWorklet] VAD: Silence threshold reached (${silenceDuration}ms).`);
+          // console.log('[AudioWorklet] VAD: Posting VAD_SILENCE_START');
+          if (this._isRecording) this.port.postMessage({ type: 'VAD_SILENCE_START' });
           this._silenceStartTime = 0; // Reset timer to prevent repeated events
         }
       }
@@ -135,8 +142,9 @@ class AudioProcessor extends AudioWorkletProcessor {
     // --- RMS Update for UI --- 
     if (nowMs - this._lastRmsUpdateTime > this._rmsUpdateInterval) {
       if (this._isRecording) {
-        // Normalize RMS for UI here if desired, e.g., Math.min(currentRms * 5, 1.0)
-        this.port.postMessage({ type: 'RMS_UPDATE', value: Math.min(currentRms * 5, 1.0) }); 
+        // Log RMS update sending (already throttled by interval)
+        // console.log(`[AudioWorklet] Posting RMS_UPDATE (Value: ${Math.min(currentRms * 5, 1.0).toFixed(4)})`); // Optional: uncomment if needed, already throttled
+        this.port.postMessage({ type: 'RMS_UPDATE', value: Math.min(currentRms * 5, 1.0) });
       }
       this._lastRmsUpdateTime = nowMs;
     }
@@ -147,9 +155,8 @@ class AudioProcessor extends AudioWorkletProcessor {
       this.port.postMessage(resampledData.buffer, [resampledData.buffer]);
     }
 
-    // Return false when not recording to terminate the processor
-    console.log(`[AudioWorklet] process function returning: ${this._isRecording}`);
-    return this._isRecording;
+    // Always return true to keep the processor node alive until explicitly terminated
+    return true;
   }
 }
 

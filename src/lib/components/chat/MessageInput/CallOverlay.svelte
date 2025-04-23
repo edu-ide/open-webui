@@ -81,7 +81,7 @@
 	const { snapshot: callSnapshot, send: sendCall } = useMachine(callMachine);
 
 	// Determine initial STT engine based on browser
-	let initialSttEngine: SttEngine = 'web';
+	let initialSttEngine: SttEngine = 'whisper-live';
 	/* // Remove or comment out browser detection for testing Whisper as default
 	if (
 		typeof navigator !== 'undefined' &&
@@ -567,7 +567,7 @@
 					<!-- Profile image / Listening indicator (Use workerIsListening, remove rmsLevel style) -->
 					<div
 						class="transition-transform duration-100 ease-out rounded-full bg-cover bg-center bg-no-repeat {$sttConfiguratorSnapshot.context.workerIsListening ? 'ring-4 ring-blue-500 ring-offset-4 dark:ring-offset-gray-800' : ''} size-40 {(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? '' : 'bg-black dark:bg-white'}"
-						style="{`${(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? `background-image: url('${model?.info?.meta?.profile_image_url}');` : ''} transform: scale(${$sttConfiguratorSnapshot.context.workerIsListening ? rmsBasedScale : 1.0});`}"
+						style="{`${(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? `background-image: url('${model?.info?.meta?.profile_image_url}');` : ''} transform: scale(${rmsBasedScale});`}"
 					/>
 				{/if}
 			</button>
@@ -600,7 +600,7 @@
 						<!-- Profile image / Listening indicator (Use workerIsListening, remove rmsLevel style) -->
 						<div
 							class="transition-transform duration-100 ease-out rounded-full bg-cover bg-center bg-no-repeat {$sttConfiguratorSnapshot.context.workerIsListening ? 'ring-4 ring-blue-500 ring-offset-4 dark:ring-offset-gray-800' : ''} size-40 {(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? '' : 'bg-black dark:bg-white'}"
-							style="{`${(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? `background-image: url('${model?.info?.meta?.profile_image_url}');` : ''} transform: scale(${$sttConfiguratorSnapshot.context.workerIsListening ? rmsBasedScale : 1.0});`}"
+							style="{`${(model?.info?.meta?.profile_image_url ?? '/static/favicon.png') !== '/static/favicon.png' ? `background-image: url('${model?.info?.meta?.profile_image_url}');` : ''} transform: scale(${rmsBasedScale});`}"
 						/>
 					{/if}
 					{#if $sttConfiguratorSnapshot.context.workerIsListening}
