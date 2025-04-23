@@ -306,7 +306,7 @@ const webSocketConnectionMachine = setup({
             retries: 0,
             // <<< Initialize keepalive context >>>
             keepaliveIntervalId: null,
-            keepaliveIntervalMs: 5000, // Send silent ping every 5 seconds
+            keepaliveIntervalMs: 2000, // <<< Reduce interval to 2 seconds >>>
             silentAudioChunk: silentBuffer
         };
     },
@@ -402,7 +402,7 @@ export const whisperLiveSttMachine = setup({
 					use_vad: context.useVad,
 					...(context.useVad && {
 						vad_parameters: {
-							onset: 0.2, // Renamed from threshold, Example value, adjust as needed
+							onset: 0.1, // Renamed from threshold, Example value, adjust as needed
 						}
 					})
 				};
@@ -543,27 +543,23 @@ export const whisperLiveSttMachine = setup({
 			isAudioProcessing: false, // Reset audio processing flag
 		}),
         // Renamed from clearContext for clarity
-		clearDynamicContext: assign(( { context } ) => { // Use object destructuring to get context
-			console.warn('[WhisperLive/Context] WARNING: Executing clearDynamicContext. This should not happen during active streaming.', { 
-				// Note: context.value is not available directly here. Logging connectionStatus instead.
-				connectionStatus: context.connectionStatus 
-			}); 
-			return {
-				websocketActor: null,
-				sourceNode: null,
-				audioWorkletNode: null,
-				mediaStream: null,
-				audioContext: null,
-				isWorkletReady: false,
-				isAudioProcessing: false,
-				connectionStatus: 'idle' as const,
-				isServerReady: false,
-				currentSegment: null,
-				finalTranscriptBuffer: null,
-				errorMessage: null,
-				rmsLevel: 0, // Reset RMS level
-			}
-		}),
+		clearDynamicContext: assign(( { context } ) => {
+            return {
+                websocketActor: null,
+                sourceNode: null,
+                audioWorkletNode: null,
+                mediaStream: null,
+                audioContext: null,
+                isWorkletReady: false,
+                isAudioProcessing: false,
+                connectionStatus: 'idle' as const,
+                isServerReady: false,
+                currentSegment: null,
+                finalTranscriptBuffer: null,
+                errorMessage: null,
+                rmsLevel: 0, // Reset RMS level
+            }
+        }),
 
 		// --- Actor Communication Updates ---
 		// REMOVE startWebSocketActor action - actor starts on spawn
@@ -1140,30 +1136,26 @@ export const whisperLiveSttMachine = setup({
 		},
 		stopping: {
 			 entry: [
-				 log('[WhisperLive] Entering stopping state.'), // Simplified log message
+				 log('[WhisperLive] Entering stopping state.'),
 				 'markAsStopping',
-                 // <<< Move handler removal to the beginning >>>
                  'removeWorkletMessageHandler',
-                 'sendStopToWorklet', // Now send stop after removing listener
-				 'stopWebSocketActorAction',
-				 'stopAllProcessing',
-				 'clearDynamicContext',
-				 'sendStateUpdateToParent'
+                 'sendStopToWorklet',
+                 'stopWebSocketActorAction',
+                 'stopAllProcessing',
+                 'sendStateUpdateToParent'
 			 ] as const,
 			 always: { target: 'idle' }
 		},
 		error: {
 			entry: [
 				'markAsStopping',
-                 // <<< Move handler removal to the beginning >>>
                 'removeWorkletMessageHandler',
 				'logError',
 				'sendErrorToParent',
-                'sendStopToWorklet', // Send stop after removing listener here too
+                'sendStopToWorklet',
 				'stopWebSocketActorAction',
 				'stopAllProcessing',
 				'clearDynamicContext'
-                // No state update needed from error entry? Parent already gets WORKER_ERROR
 			] as const,
 			on: {
 				START_LISTENING: { target: 'initializingAudio' },
