@@ -33,6 +33,7 @@ from open_webui.config import (
     WHISPER_MODEL_AUTO_UPDATE,
     WHISPER_MODEL_DIR,
     CACHE_DIR,
+    WHISPER_LANGUAGE,
 )
 
 from open_webui.constants import ERROR_MESSAGES
@@ -80,9 +81,63 @@ SPEECH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 #
 ##########################################
 
-# def get_audio_format(file_path): ...
-# def convert_audio_to_wav(file_path, output_path, conversion_type=None): ...
-# def set_faster_whisper_model(model: str, auto_update: bool = False): ...
+from pydub import AudioSegment
+from pydub.utils import mediainfo
+
+
+def get_audio_convert_format(file_path):
+    """Check if the given file needs to be converted to a different format."""
+    if not os.path.isfile(file_path):
+        log.error(f"File not found: {file_path}")
+        return False
+
+    try:
+        info = mediainfo(file_path)
+
+        if (
+            info.get("codec_name") == "aac"
+            and info.get("codec_type") == "audio"
+            and info.get("codec_tag_string") == "mp4a"
+        ):
+            return "mp4"
+        elif info.get("format_name") == "ogg":
+            return "ogg"
+    except Exception as e:
+        log.error(f"Error getting audio format: {e}")
+        return False
+
+    return None
+
+
+def convert_audio_to_wav(file_path, output_path, conversion_type):
+    """Convert MP4/OGG audio file to WAV format."""
+    audio = AudioSegment.from_file(file_path, format=conversion_type)
+    audio.export(output_path, format="wav")
+    log.info(f"Converted {file_path} to {output_path}")
+
+
+def set_faster_whisper_model(model: str, auto_update: bool = False):
+    whisper_model = None
+    if model:
+        from faster_whisper import WhisperModel
+
+        faster_whisper_kwargs = {
+            "model_size_or_path": model,
+            "device": DEVICE_TYPE if DEVICE_TYPE and DEVICE_TYPE == "cuda" else "cpu",
+            "compute_type": "int8",
+            "download_root": WHISPER_MODEL_DIR,
+            "local_files_only": not auto_update,
+        }
+
+        try:
+            whisper_model = WhisperModel(**faster_whisper_kwargs)
+        except Exception:
+            log.warning(
+                "WhisperModel initialization failed, attempting download with local_files_only=False"
+            )
+            faster_whisper_kwargs["local_files_only"] = False
+            whisper_model = WhisperModel(**faster_whisper_kwargs)
+    return whisper_model
 
 
 ##########################################
@@ -101,6 +156,7 @@ class TTSConfigForm(BaseModel):
     VOICE: str
     SPLIT_ON: str
     AZURE_SPEECH_REGION: str
+    AZURE_SPEECH_BASE_URL: str
     AZURE_SPEECH_OUTPUT_FORMAT: str
 
 
@@ -114,6 +170,8 @@ class STTConfigForm(BaseModel):
     AZURE_API_KEY: str
     AZURE_REGION: str
     AZURE_LOCALES: str
+    AZURE_BASE_URL: str
+    AZURE_MAX_SPEAKERS: str
 
 
 class AudioConfigUpdateForm(BaseModel):
@@ -133,6 +191,7 @@ async def get_audio_config(request: Request, user=Depends(get_admin_user)):
             "VOICE": request.app.state.config.TTS_VOICE,
             "SPLIT_ON": request.app.state.config.TTS_SPLIT_ON,
             "AZURE_SPEECH_REGION": request.app.state.config.TTS_AZURE_SPEECH_REGION,
+            "AZURE_SPEECH_BASE_URL": request.app.state.config.TTS_AZURE_SPEECH_BASE_URL,
             "AZURE_SPEECH_OUTPUT_FORMAT": request.app.state.config.TTS_AZURE_SPEECH_OUTPUT_FORMAT,
         },
         "stt": {
@@ -145,6 +204,8 @@ async def get_audio_config(request: Request, user=Depends(get_admin_user)):
             "AZURE_API_KEY": request.app.state.config.AUDIO_STT_AZURE_API_KEY,
             "AZURE_REGION": request.app.state.config.AUDIO_STT_AZURE_REGION,
             "AZURE_LOCALES": request.app.state.config.AUDIO_STT_AZURE_LOCALES,
+            "AZURE_BASE_URL": request.app.state.config.AUDIO_STT_AZURE_BASE_URL,
+            "AZURE_MAX_SPEAKERS": request.app.state.config.AUDIO_STT_AZURE_MAX_SPEAKERS,
         },
     }
 
@@ -161,6 +222,9 @@ async def update_audio_config(
     request.app.state.config.TTS_VOICE = form_data.tts.VOICE
     request.app.state.config.TTS_SPLIT_ON = form_data.tts.SPLIT_ON
     request.app.state.config.TTS_AZURE_SPEECH_REGION = form_data.tts.AZURE_SPEECH_REGION
+    request.app.state.config.TTS_AZURE_SPEECH_BASE_URL = (
+        form_data.tts.AZURE_SPEECH_BASE_URL
+    )
     request.app.state.config.TTS_AZURE_SPEECH_OUTPUT_FORMAT = (
         form_data.tts.AZURE_SPEECH_OUTPUT_FORMAT
     )
@@ -174,6 +238,10 @@ async def update_audio_config(
     request.app.state.config.AUDIO_STT_AZURE_API_KEY = form_data.stt.AZURE_API_KEY
     request.app.state.config.AUDIO_STT_AZURE_REGION = form_data.stt.AZURE_REGION
     request.app.state.config.AUDIO_STT_AZURE_LOCALES = form_data.stt.AZURE_LOCALES
+    request.app.state.config.AUDIO_STT_AZURE_BASE_URL = form_data.stt.AZURE_BASE_URL
+    request.app.state.config.AUDIO_STT_AZURE_MAX_SPEAKERS = (
+        form_data.stt.AZURE_MAX_SPEAKERS
+    )
 
     # Update whisper model if engine is local ('')
     if request.app.state.config.STT_ENGINE == "":
@@ -197,6 +265,7 @@ async def update_audio_config(
             "VOICE": request.app.state.config.TTS_VOICE,
             "SPLIT_ON": request.app.state.config.TTS_SPLIT_ON,
             "AZURE_SPEECH_REGION": request.app.state.config.TTS_AZURE_SPEECH_REGION,
+            "AZURE_SPEECH_BASE_URL": request.app.state.config.TTS_AZURE_SPEECH_BASE_URL,
             "AZURE_SPEECH_OUTPUT_FORMAT": request.app.state.config.TTS_AZURE_SPEECH_OUTPUT_FORMAT,
         },
         "stt": {
@@ -209,6 +278,8 @@ async def update_audio_config(
             "AZURE_API_KEY": request.app.state.config.AUDIO_STT_AZURE_API_KEY,
             "AZURE_REGION": request.app.state.config.AUDIO_STT_AZURE_REGION,
             "AZURE_LOCALES": request.app.state.config.AUDIO_STT_AZURE_LOCALES,
+            "AZURE_BASE_URL": request.app.state.config.AUDIO_STT_AZURE_BASE_URL,
+            "AZURE_MAX_SPEAKERS": request.app.state.config.AUDIO_STT_AZURE_MAX_SPEAKERS,
         },
     }
 
@@ -366,7 +437,8 @@ async def speech(request: Request, user=Depends(get_verified_user)):
             log.exception(e)
             raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-        region = request.app.state.config.TTS_AZURE_SPEECH_REGION
+        region = request.app.state.config.TTS_AZURE_SPEECH_REGION or "eastus"
+        base_url = request.app.state.config.TTS_AZURE_SPEECH_BASE_URL
         language = request.app.state.config.TTS_VOICE
         locale = "-".join(request.app.state.config.TTS_VOICE.split("-")[:1])
         output_format = request.app.state.config.TTS_AZURE_SPEECH_OUTPUT_FORMAT
@@ -380,7 +452,8 @@ async def speech(request: Request, user=Depends(get_verified_user)):
                 timeout=timeout, trust_env=True
             ) as session:
                 async with session.post(
-                    f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1",
+                    (base_url or f"https://{region}.tts.speech.microsoft.com")
+                    + "/cognitiveservices/v1",
                     headers={
                         "Ocp-Apim-Subscription-Key": request.app.state.config.TTS_API_KEY,
                         "Content-Type": "application/ssml+xml",
@@ -657,6 +730,73 @@ def compress_audio(file_path):
         return file_path
 
 
+@router.post("/transcriptions")
+def transcription(
+    request: Request,
+    file: UploadFile = File(...),
+    user=Depends(get_verified_user),
+):
+    log.info(f"file.content_type: {file.content_type}")
+
+    supported_filetypes = (
+        "audio/mpeg",
+        "audio/wav",
+        "audio/ogg",
+        "audio/x-m4a",
+        "audio/webm",
+    )
+
+    if not file.content_type.startswith(supported_filetypes):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.FILE_NOT_SUPPORTED,
+        )
+
+    try:
+        ext = file.filename.split(".")[-1]
+        id = uuid.uuid4()
+
+        filename = f"{id}.{ext}"
+        contents = file.file.read()
+
+        file_dir = f"{CACHE_DIR}/audio/transcriptions"
+        os.makedirs(file_dir, exist_ok=True)
+        file_path = f"{file_dir}/{filename}"
+
+        with open(file_path, "wb") as f:
+            f.write(contents)
+
+        try:
+            try:
+                file_path = compress_audio(file_path)
+            except Exception as e:
+                log.exception(e)
+
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=ERROR_MESSAGES.DEFAULT(e),
+                )
+
+            data = transcribe(request, file_path)
+            file_path = file_path.split("/")[-1]
+            return {**data, "filename": file_path}
+        except Exception as e:
+            log.exception(e)
+
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=ERROR_MESSAGES.DEFAULT(e),
+            )
+
+    except Exception as e:
+        log.exception(e)
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT(e),
+        )
+
+
 def get_available_models(request: Request) -> list[dict]:
     available_models = []
     if request.app.state.config.TTS_ENGINE == "openai":
@@ -748,7 +888,10 @@ def get_available_voices(request) -> dict:
     elif request.app.state.config.TTS_ENGINE == "azure":
         try:
             region = request.app.state.config.TTS_AZURE_SPEECH_REGION
-            url = f"https://{region}.tts.speech.microsoft.com/cognitiveservices/voices/list"
+            base_url = request.app.state.config.TTS_AZURE_SPEECH_BASE_URL
+            url = (
+                base_url or f"https://{region}.tts.speech.microsoft.com"
+            ) + "/cognitiveservices/voices/list"
             headers = {
                 "Ocp-Apim-Subscription-Key": request.app.state.config.TTS_API_KEY
             }
