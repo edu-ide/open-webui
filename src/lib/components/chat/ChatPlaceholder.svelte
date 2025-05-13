@@ -50,7 +50,7 @@
 							)}
 							placement="right"
 						>
-							<img
+							<!-- <img
 								crossorigin="anonymous"
 								src={model?.info?.meta?.profile_image_url ??
 									($i18n.language === 'dg-DG'
@@ -59,7 +59,7 @@
 								class=" size-[2.7rem] rounded-full border-[1px] border-gray-100 dark:border-none"
 								alt="logo"
 								draggable="false"
-							/>
+							/> -->
 						</Tooltip>
 					</button>
 				{/each}
@@ -86,7 +86,7 @@
 					{#if models[selectedModelIdx]?.name}
 						{models[selectedModelIdx]?.name}
 					{:else}
-						{$i18n.t('Hello, {{name}}', { name: $user?.name })}
+						<!-- {$i18n.t('Hello, {{name}}', { name: $user?.name })} -->
 					{/if}
 				</div>
 

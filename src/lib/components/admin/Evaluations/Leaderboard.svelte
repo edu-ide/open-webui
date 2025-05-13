@@ -352,11 +352,11 @@
 						<td class="px-3 py-1.5 flex flex-col justify-center">
 							<div class="flex items-center gap-2">
 								<div class="shrink-0">
-									<img
+									<!-- <img
 										src={model?.info?.meta?.profile_image_url ?? '/favicon.png'}
 										alt={model.name}
 										class="size-5 rounded-full object-cover shrink-0"
-									/>
+									/> -->
 								</div>
 
 								<div class="font-medium text-gray-800 dark:text-gray-200 pr-4">

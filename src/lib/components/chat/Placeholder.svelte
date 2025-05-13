@@ -120,7 +120,7 @@
 										selectedModelIdx = modelIdx;
 									}}
 								>
-									<img
+									<!-- <img
 										crossorigin="anonymous"
 										src={model?.info?.meta?.profile_image_url ??
 											($i18n.language === 'dg-DG'
@@ -129,20 +129,20 @@
 										class=" size-9 @sm:size-10 rounded-full border-[1px] border-gray-100 dark:border-none"
 										alt="logo"
 										draggable="false"
-									/>
+									/> -->
 								</button>
 							</Tooltip>
 						{/each}
 					</div>
 				</div>
 
-				<div class=" text-3xl @sm:text-4xl line-clamp-1" in:fade={{ duration: 100 }}>
+				<!-- <div class=" text-3xl @sm:text-4xl line-clamp-1" in:fade={{ duration: 100 }}>
 					{#if models[selectedModelIdx]?.name}
 						{models[selectedModelIdx]?.name}
 					{:else}
 						{$i18n.t('Hello, {{name}}', { name: $user?.name })}
 					{/if}
-				</div>
+				</div> -->
 			</div>
 
 			<div class="flex mt-1 mb-2">
@@ -218,7 +218,7 @@
 			</div>
 		</div>
 	</div>
-	<div class="mx-auto max-w-2xl font-primary" in:fade={{ duration: 200, delay: 200 }}>
+	<!-- <div class="mx-auto max-w-2xl font-primary" in:fade={{ duration: 200, delay: 200 }}>
 		<div class="mx-5">
 			<Suggestions
 				suggestionPrompts={atSelectedModel?.info?.meta?.suggestion_prompts ??
@@ -231,5 +231,5 @@
 				}}
 			/>
 		</div>
-	</div>
+	</div> -->
 </div>
