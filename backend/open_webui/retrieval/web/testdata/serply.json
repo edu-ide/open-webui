@@ -94,12 +94,12 @@
 		},
 		{
 			"title": "Apple Inc. (AAPL) Company Profile & Facts",
-			"link": "https://finance.yahoo.com/quote/AAPL/profile/",
+			"link": "https://finance.yahoo.com/quote/AAPL/user/",
 			"description": "Apple Inc. designs, manufactures, and markets smartphones, personal computers, tablets, wearables, and accessories worldwide. The company offers iPhone, a line ...",
 			"additional_links": [
 				{
 					"text": "Apple Inc. (AAPL) Company Profile & FactsYahoo Financehttps://finance.yahoo.com › quote › AAPL › profile",
-					"href": "https://finance.yahoo.com/quote/AAPL/profile/"
+					"href": "https://finance.yahoo.com/quote/AAPL/user/"
 				}
 			],
 			"cite": {
@@ -110,16 +110,16 @@
 		},
 		{
 			"title": "Apple Inc - Company Profile and News",
-			"link": "https://www.bloomberg.com/profile/company/AAPL:US",
+			"link": "https://www.bloomberg.com/user/company/AAPL:US",
 			"description": "Apple Inc. Apple Inc. designs, manufactures, and markets smartphones, personal computers, tablets, wearables and accessories, and sells a variety of related ...",
 			"additional_links": [
 				{
 					"text": "Apple Inc - Company Profile and NewsBloomberghttps://www.bloomberg.com › company › AAPL:US",
-					"href": "https://www.bloomberg.com/profile/company/AAPL:US"
+					"href": "https://www.bloomberg.com/user/company/AAPL:US"
 				},
 				{
 					"text": "",
-					"href": "https://www.bloomberg.com/profile/company/AAPL:US"
+					"href": "https://www.bloomberg.com/user/company/AAPL:US"
 				}
 			],
 			"cite": {

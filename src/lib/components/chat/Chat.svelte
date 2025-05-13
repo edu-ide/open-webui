@@ -2145,3 +2145,104 @@
 		</div>
 	{/if}
 </div>
+
+<style>
+	/* :host는 웹 컴포넌트 자체를 선택합니다. */
+	:host {
+		display: block; /* 웹 컴포넌트가 레이아웃에 참여하도록 */
+		height: 100%;
+		font-family: var(--vscode-font-family, 'Inter', sans-serif); /* microblog-lms의 변수 */
+	}
+
+	.chat-container-wrapper {
+		display: flex;
+		flex-direction: column;
+		height: 100%;
+		background-color: var(--my-card-background, #ffffff); /* microblog-lms 변수 */
+		color: var(--theme-text, #212529); /* microblog-lms 변수 */
+		border: 1px solid var(--theme-border, #e0e0e0);
+		border-radius: 8px; /* 예시 */
+		padding: 16px; /* 예시 */
+		box-sizing: border-box;
+	}
+
+	.chat-header {
+		border-bottom: 1px solid var(--theme-border-light, #f0f0f0);
+		padding-bottom: 10px;
+		margin-bottom: 10px;
+	}
+
+	.chat-header h3 {
+		color: var(--theme-primary, #007bff); /* microblog-lms 변수 */
+		margin-top: 0;
+	}
+
+	.auth-status {
+		font-size: 0.9em;
+		color: var(--theme-text-secondary, #555);
+	}
+	.auth-status.unauthenticated {
+		color: var(--theme-error, red);
+	}
+
+
+	/* --- 아래는 기존 Chat.svelte의 스타일을 CSS 변수를 사용하도록 수정한 예시입니다. --- */
+	/* 실제 Chat.svelte의 클래스명과 구조에 맞게 수정해야 합니다. */
+
+	.messages-area {
+		flex-grow: 1;
+		overflow-y: auto;
+		padding: 8px;
+		background-color: var(--theme-paper-hover, #f8f9fa); /* microblog-lms 변수 */
+		border-radius: 4px;
+	}
+
+	.message {
+		padding: 10px;
+		margin-bottom: 8px;
+		border-radius: 6px;
+		background-color: var(--vscode-editorWidget-background, var(--theme-paper-light)); /* VSCode 변수 또는 microblog-lms 변수 */
+		color: var(--vscode-editorWidget-foreground, var(--theme-text));
+	}
+
+	.message.user-message { /* 예시 클래스 */
+		background-color: var(--theme-primary-light, #cfe2ff);
+		color: var(--theme-primary-dark, #0056b3);
+		text-align: right; /* 예시 */
+	}
+
+	.input-area {
+		display: flex;
+		padding-top: 10px;
+		border-top: 1px solid var(--theme-border-light, #f0f0f0);
+	}
+
+	.input-area input[type="text"] {
+		flex-grow: 1;
+		padding: 10px;
+		border: 1px solid var(--vscode-input-border, var(--theme-border)); /* VSCode 또는 microblog-lms 변수 */
+		border-radius: 4px;
+		background-color: var(--vscode-input-background, #fff);
+		color: var(--vscode-input-foreground, var(--theme-text));
+		margin-right: 8px;
+	}
+
+	.input-area input[type="text"]:focus {
+		border-color: var(--vscode-focusBorder, var(--theme-primary));
+		outline: none;
+	}
+
+	.input-area button {
+		padding: 10px 15px;
+		background-color: var(--vscode-button-background, var(--theme-primary)); /* VSCode 또는 microblog-lms 변수 */
+		color: var(--vscode-button-foreground, var(--theme-primary-text)); /* VSCode 또는 microblog-lms 변수 */
+		border: 1px solid var(--vscode-button-border, transparent);
+		border-radius: 4px;
+		cursor: pointer;
+		font-weight: bold;
+	}
+
+	.input-area button:hover {
+		background-color: var(--vscode-button-hoverBackground, var(--theme-primary-light)); /* VSCode 또는 microblog-lms 변수 */
+	}
+</style>

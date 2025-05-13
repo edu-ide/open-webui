@@ -25,7 +25,7 @@ export default defineConfig(({ command, mode }) => {
 		plugins: [
 			sveltekit(),
 			viteStaticCopy({
-				targets: [
+			targets: [
 					{
 						src: 'node_modules/onnxruntime-web/dist/*.jsep.*',
 						dest: 'wasm'
@@ -34,6 +34,7 @@ export default defineConfig(({ command, mode }) => {
 			})
 		],
 		server: {
+			port: 5175,
 			fs: {
 				allow: [path.resolve(__dirname, 'dist')]
 			},
