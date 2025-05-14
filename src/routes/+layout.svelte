@@ -1,4 +1,4 @@
-<script>
+<script lang="ts" >
 	import { io } from 'socket.io-client';
 	import { spring } from 'svelte/motion';
 	import PyodideWorker from '$lib/workers/pyodide.worker?worker';

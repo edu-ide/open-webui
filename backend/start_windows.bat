@@ -6,6 +6,18 @@ SETLOCAL ENABLEDELAYEDEXPANSION
 SET "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%" || exit /b
 
+:: Load .env file variables
+SET "ENV_FILE=.env"
+IF EXIST "%ENV_FILE%" (
+    echo Loading environment variables from %ENV_FILE%
+    FOR /F "usebackq tokens=1,* delims==" %%A IN ("%ENV_FILE%") DO (
+        SET "%%A=%%B"
+        echo Set %%A=%%B
+    )
+) ELSE (
+    echo %ENV_FILE% not found.
+)
+
 :: Add conditional Playwright browser installation
 IF /I "%WEB_LOADER_ENGINE%" == "playwright" (
     IF "%PLAYWRIGHT_WS_URL%" == "" (
@@ -44,7 +56,7 @@ SET "WEBUI_SECRET_KEY=%WEBUI_SECRET_KEY%"
 IF "%UVICORN_WORKERS%"=="" SET UVICORN_WORKERS=1
 
 :: Add src and generated client paths to PYTHONPATH
-SET "PYTHONPATH=%SCRIPT_DIR%src;%SCRIPT_DIR%src\generated_internal_client;%PYTHONPATH%"
+SET "PYTHONPATH=%SCRIPT_DIR%src;%SCRIPT_DIR%src\\generated_internal_client;%PYTHONPATH%"
 
 uvicorn open_webui.main:app --host "%HOST%" --port "%PORT%" --forwarded-allow-ips '*' --workers %UVICORN_WORKERS% --ws auto --reload
 :: For ssl user uvicorn open_webui.main:app --host "%HOST%" --port "%PORT%" --forwarded-allow-ips '*' --ssl-keyfile "key.pem" --ssl-certfile "cert.pem" --ws auto

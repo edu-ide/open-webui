@@ -407,6 +407,7 @@ from open_webui.tasks import (
 )  # Import from tasks.py
 
 from open_webui.utils.redis import get_sentinels_from_env
+from open_webui.services.kafka_consumer import consume_user_created_events # Kafka consumer 임포트
 
 
 if SAFE_MODE:
@@ -470,7 +471,25 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(periodic_usage_pool_cleanup())
 
+    # Kafka consumer 시작
+    kafka_consumer_task = asyncio.create_task(consume_user_created_events())
+    log.info("Kafka consumer task created.")
+
     yield
+
+    # 애플리케이션 종료 시 Kafka consumer 중지
+    log.info("Attempting to stop Kafka consumer task...")
+    if kafka_consumer_task and not kafka_consumer_task.done():
+        kafka_consumer_task.cancel()
+        try:
+            await kafka_consumer_task
+            log.info("Kafka consumer task cancelled and awaited.")
+        except asyncio.CancelledError:
+            log.info("Kafka consumer task successfully cancelled (asyncio.CancelledError).")
+        except Exception as e:
+            log.error(f"Error during Kafka consumer task shutdown: {e}", exc_info=True)
+    else:
+        log.info("Kafka consumer task was already done or not started.")
 
 
 app = FastAPI(

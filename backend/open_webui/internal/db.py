@@ -22,6 +22,11 @@ from sqlalchemy.pool import QueuePool, NullPool
 from sqlalchemy.sql.type_api import _T
 from typing_extensions import Self
 
+# 임시 로깅 추가
+logging.basicConfig(level=logging.INFO) # 이미 설정되어 있다면 중복 불필요
+logger_db_config = logging.getLogger("DB_CONFIG_CHECK")
+logger_db_config.info(f"DATABASE_URL being used by db.py: {DATABASE_URL}")
+
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["DB"])
 
@@ -102,6 +107,19 @@ SessionLocal = sessionmaker(
 )
 metadata_obj = MetaData(schema=DATABASE_SCHEMA)
 Base = declarative_base(metadata=metadata_obj)
+
+# SQLAlchemy Base를 사용하는 모든 모델에 대한 테이블을 생성합니다.
+# 데이터베이스가 연결되어 있고 (예: engine이 None이 아님),
+# 해당 테이블이 아직 존재하지 않는 경우에만 테이블이 생성됩니다.
+# 프로덕션 환경이나 복잡한 스키마 변경 관리에는 Alembic과 같은
+# 마이그레이션 도구를 사용하는 것이 권장됩니다.
+if engine:
+    try:
+        Base.metadata.create_all(bind=engine)
+        log.info("SQLAlchemy models' tables created successfully or already exist.")
+    except Exception as e:
+        log.error(f"Error creating SQLAlchemy models' tables: {e}")
+
 Session = scoped_session(SessionLocal)
 
 
