@@ -1198,11 +1198,15 @@ export const updatePipelineValves = async (
 export const getBackendConfig = async () => {
 	let error = null;
 
+	// localStorage.token에서 토큰을 읽어옴
+	const token = typeof window !== 'undefined' ? localStorage.getItem('token') : '';
+
 	const res = await fetch(`${WEBUI_BASE_URL}/api/config`, {
 		method: 'GET',
 		credentials: 'include',
 		headers: {
-			'Content-Type': 'application/json'
+			'Content-Type': 'application/json',
+			...(token ? { Authorization: `Bearer ${token}` } : {})
 		}
 	})
 		.then(async (res) => {

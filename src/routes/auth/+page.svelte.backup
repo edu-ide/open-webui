@@ -6,7 +6,7 @@
 	import { page } from '$app/stores';
 
 	import { getBackendConfig } from '$lib/apis';
-	import { ldapUserSignIn, getSessionUser, userSignIn, userSignUp, tokenAuth } from '$lib/apis/auths';
+	import { ldapUserSignIn, getSessionUser, userSignIn, userSignUp } from '$lib/apis/auths';
 
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
 	import { WEBUI_NAME, config, user, socket } from '$lib/stores';
@@ -15,8 +15,6 @@
 
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import OnBoarding from '$lib/components/OnBoarding.svelte';
-
-	import { accessToken } from '$lib/stores/accessToken';
 
 	const i18n = getContext('i18n');
 
@@ -53,21 +51,11 @@
 	};
 
 	const signInHandler = async () => {
-		let tokenValue;
-		const unsubscribe = accessToken.subscribe((v) => { tokenValue = v });
-		let sessionUser;
-		if (tokenValue) {
-			sessionUser = await tokenAuth(tokenValue).catch((error) => {
-				toast.error(`${error}`);
-				return null;
-			});
-		} else {
-			sessionUser = await userSignIn(email, password).catch((error) => {
-				toast.error(`${error}`);
-				return null;
-			});
-		}
-		unsubscribe();
+		const sessionUser = await userSignIn(email, password).catch((error) => {
+			toast.error(`${error}`);
+			return null;
+		});
+
 		await setSessionUser(sessionUser);
 	};
 

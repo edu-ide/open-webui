@@ -48,7 +48,21 @@
 	import NotificationToast from '$lib/components/NotificationToast.svelte';
 	import AppSidebar from '$lib/components/app/AppSidebar.svelte';
 	import { chatCompletion } from '$lib/apis/openai';
+	import { accessToken } from '$lib/stores/accessToken';
 
+	onMount(() => {
+		function handleMessage(event: MessageEvent) {
+			// 보안: origin 체크 필요 (예: 'http://localhost:5173' 등)
+			// if (event.origin !== 'http://localhost:5173') return;
+			if (event.data?.type === 'AUTH_TOKEN' && event.data.token) {
+				console.log('AUTH_TOKEN', event.data.token);
+				accessToken.set(event.data.token);
+				// 필요하다면 localStorage 등에 저장 가능
+			}
+		}
+		window.addEventListener('message', handleMessage);
+		return () => window.removeEventListener('message', handleMessage);
+	});
 	setContext('i18n', i18n);
 
 	const bc = new BroadcastChannel('active-tab-channel');

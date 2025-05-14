@@ -4,6 +4,7 @@ import time
 import datetime
 import logging
 from aiohttp import ClientSession
+import base64
 
 from open_webui.models.auths import (
     AddUserForm,
@@ -908,3 +909,108 @@ async def get_api_key(user=Depends(get_current_user)):
         }
     else:
         raise HTTPException(404, detail=ERROR_MESSAGES.API_KEY_NOT_FOUND)
+
+
+# TODO: 이 값들은 실제 환경에서는 환경 변수나 설정 파일에서 불러와야 합니다.
+INTROSPECTION_ENDPOINT_URI = "http://localhost:8881/oauth2/introspect"
+INTROSPECTION_CLIENT_ID = "internal-introspection-client"
+INTROSPECTION_CLIENT_SECRET = "introspection-secret"
+
+
+@router.post("/token-auth", response_model=SessionUserResponse)
+async def token_auth(request: Request, response: Response):
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(401, detail="Authorization header with Bearer token required.")
+    
+    opaque_token = auth_header[len("Bearer "):]
+
+    # Basic Auth 헤더 생성
+    auth_str = f"{INTROSPECTION_CLIENT_ID}:{INTROSPECTION_CLIENT_SECRET}"
+    basic_auth_header = f"Basic {base64.b64encode(auth_str.encode()).decode()}"
+
+    introspection_data = {'token': opaque_token, 'token_type_hint': 'access_token'}
+
+    try:
+        async with ClientSession() as session:
+            async with session.post(
+                INTROSPECTION_ENDPOINT_URI,
+                data=introspection_data,
+                headers={
+                    "Authorization": basic_auth_header,
+                    "Content-Type": "application/x-www-form-urlencoded"
+                }
+            ) as introspection_response:
+                if introspection_response.status != 200:
+                    # Introspection 요청 실패
+                    try:
+                        error_detail = await introspection_response.json()
+                    except:
+                        error_detail = await introspection_response.text()
+                    raise HTTPException(status_code=introspection_response.status, detail=f"Token introspection failed: {error_detail}")
+                
+                introspection_result = await introspection_response.json()
+
+    except Exception as e:
+        # 네트워크 오류 등
+        raise HTTPException(status_code=500, detail=f"Error during token introspection: {str(e)}")
+
+    if not introspection_result.get("active"):
+        raise HTTPException(401, detail="Token is not active or invalid.")
+
+    # Introspection 응답에서 사용자 식별자 (sub) 추출
+    user_subject = introspection_result.get("sub")
+    if not user_subject:
+        # 'username' 필드를 백업으로 사용해볼 수 있습니다. demo.yml 에서는 google provider가 sub를, github이 id를 사용한다고 되어있지만,
+        # introspection 응답은 일반적으로 sub를 제공합니다. 만약 username을 사용한다면 Users.get_user_by_email() 등을 고려해야 합니다.
+        user_subject = introspection_result.get("username") 
+        if not user_subject:
+             raise HTTPException(401, detail="User identifier (sub or username) not found in token introspection response.")
+    
+    # 로컬 DB에서 사용자 조회 (oauth_sub 필드 사용)
+    # from open_webui.models.users import Users # 파일 상단에 이미 import 되어있어야 함
+    user = Users.get_user_by_oauth_sub(user_subject)
+    
+    if not user:
+        # 사용자를 찾지 못한 경우, 필요에 따라 자동 가입 로직을 추가하거나, 접근 거부 처리
+        # 여기서는 간단히 접근 거부
+        # 만약 username을 사용했다면 Users.get_user_by_email(user_subject) 시도
+        # if introspection_result.get("username") and user_subject == introspection_result.get("username"): # username으로 찾았었다면
+        #     user = Users.get_user_by_email(user_subject) # 이메일로 다시 찾아보기
+        # if not user:
+        raise HTTPException(401, detail=f"User with subject/username '{user_subject}' not found locally or not provisioned.")
+
+    # 사용자 인증 성공, 세션 정보 반환
+    # Opaque 토큰의 만료 시간은 Introspection 응답의 'exp' 필드를 사용
+    expires_at = introspection_result.get("exp") 
+    
+    datetime_expires_at = (
+        datetime.datetime.fromtimestamp(expires_at, datetime.timezone.utc)
+        if expires_at else None
+    )
+    
+    # 클라이언트에게 전달하는 토큰은 원래의 Opaque 토큰
+    response.set_cookie(
+        key="token",
+        value=opaque_token, # 쿠키에도 원래 opaque 토큰 저장
+        expires=datetime_expires_at,
+        httponly=True,
+        samesite=WEBUI_AUTH_COOKIE_SAME_SITE,
+        secure=WEBUI_AUTH_COOKIE_SECURE,
+    )
+    
+    user_permissions = get_permissions(
+        user.id, request.app.state.config.USER_PERMISSIONS
+    )
+    
+    return {
+        "token": opaque_token, # 응답에도 원래 opaque 토큰 반환
+        "token_type": "Bearer",
+        "expires_at": expires_at,
+        "id": user.id,
+        "email": user.email,
+        "name": user.name,
+        "role": user.role,
+        "profile_image_url": user.profile_image_url,
+        "permissions": user_permissions,
+    }

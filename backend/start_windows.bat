@@ -46,5 +46,5 @@ IF "%UVICORN_WORKERS%"=="" SET UVICORN_WORKERS=1
 :: Add src and generated client paths to PYTHONPATH
 SET "PYTHONPATH=%SCRIPT_DIR%src;%SCRIPT_DIR%src\generated_internal_client;%PYTHONPATH%"
 
-uvicorn open_webui.main:app --host "%HOST%" --port "%PORT%" --forwarded-allow-ips '*' --workers %UVICORN_WORKERS% --ws auto
+uvicorn open_webui.main:app --host "%HOST%" --port "%PORT%" --forwarded-allow-ips '*' --workers %UVICORN_WORKERS% --ws auto --reload
 :: For ssl user uvicorn open_webui.main:app --host "%HOST%" --port "%PORT%" --forwarded-allow-ips '*' --ssl-keyfile "key.pem" --ssl-certfile "cert.pem" --ws auto
