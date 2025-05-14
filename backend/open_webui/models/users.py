@@ -157,7 +157,14 @@ class UsersTable:
                 return UserModel.model_validate(user)
         except Exception:
             return None
-
+    def get_user_by_name(self, name: str) -> Optional[UserModel]:
+        try:
+            with get_db() as db:
+                user = db.query(User).filter_by(name=name).first()
+                return UserModel.model_validate(user)
+        except Exception:
+            return None
+        
     def get_user_by_oauth_sub(self, sub: str) -> Optional[UserModel]:
         try:
             with get_db() as db:

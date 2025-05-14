@@ -123,7 +123,7 @@ async def consume_user_created_events():
                     continue
                 
                 email = authserver_user_data.get('email')
-                name = authserver_user_data.get('name', user_uuid_from_kafka)
+                name = authserver_user_data.get('username', user_uuid_from_kafka)
                 
                 # profileImageUrl 처리: None일 경우 기본값 "/user.png" 사용
                 auth_profile_url = authserver_user_data.get('profileImageUrl')

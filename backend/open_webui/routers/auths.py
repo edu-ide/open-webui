@@ -960,6 +960,7 @@ async def token_auth(request: Request, response: Response):
 
     # Introspection 응답에서 사용자 식별자 (sub) 추출
     user_subject = introspection_result.get("sub")
+    print(f"user_subject: {user_subject}")
     if not user_subject:
         # 'username' 필드를 백업으로 사용해볼 수 있습니다. demo.yml 에서는 google provider가 sub를, github이 id를 사용한다고 되어있지만,
         # introspection 응답은 일반적으로 sub를 제공합니다. 만약 username을 사용한다면 Users.get_user_by_email() 등을 고려해야 합니다.
@@ -969,7 +970,7 @@ async def token_auth(request: Request, response: Response):
     
     # 로컬 DB에서 사용자 조회 (oauth_sub 필드 사용)
     # from open_webui.models.users import Users # 파일 상단에 이미 import 되어있어야 함
-    user = Users.get_user_by_oauth_sub(user_subject)
+    user = Users.get_user_by_name(user_subject)
     
     if not user:
         # 사용자를 찾지 못한 경우, 필요에 따라 자동 가입 로직을 추가하거나, 접근 거부 처리

@@ -36,6 +36,10 @@ log.setLevel(SRC_LOG_LEVELS["OAUTH"])
 SESSION_SECRET = WEBUI_SECRET_KEY
 ALGORITHM = "HS256"
 
+
+INTROSPECTION_URL = "http://localhost:8881/oauth2/introspect"
+CLIENT_ID = "internal-introspection-client"
+CLIENT_SECRET = "introspection-secret"
 ##############
 # Auth Utils
 ##############
@@ -151,6 +155,18 @@ def get_http_authorization_cred(auth_header: Optional[str]):
         return HTTPAuthorizationCredentials(scheme=scheme, credentials=credentials)
     except Exception:
         return None
+def introspect_token(token: str):
+    response = requests.post(
+        INTROSPECTION_URL,
+        data={"token": token},
+        auth=(CLIENT_ID, CLIENT_SECRET)
+    )
+    if response.status_code != 200:
+        raise HTTPException(status_code=401, detail="Token introspection failed")
+    token_info = response.json()
+    if not token_info.get("active"):
+        raise HTTPException(status_code=401, detail="Token is not active")
+    return token_info
 
 
 def get_current_user(
@@ -195,7 +211,31 @@ def get_current_user(
                 )
 
         return get_current_user_by_api_key(token)
+    # Opaque token introspection (Spring 인증서버)
+    try:
+        token_info = introspect_token(token)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
 
+    # introspect 결과에서 user_id(sub 등) 추출 (Spring 설정에 따라 다름)
+    username = token_info.get("sub")  # 또는 "user_id", "username" 등 실제 필드명에 맞게 수정
+    log.info(f"username: {username}")
+    if not username:
+        raise HTTPException(status_code=401, detail="User ID not found in token introspect result")
+    user = Users.get_user_by_name(username)
+   
+      
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.INVALID_TOKEN,
+        )
+    if background_tasks:
+        background_tasks.add_task(Users.update_user_last_active_by_id, user.id)
+    return user
     # auth by jwt token
     try:
         data = decode_token(token)
