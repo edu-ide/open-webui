@@ -109,7 +109,7 @@
 				<div class="flex shrink-0 justify-center">
 					<div class="flex -space-x-4 mb-0.5" in:fade={{ duration: 100 }}>
 						{#each models as model, modelIdx}
-							<Tooltip
+							<!-- <Tooltip
 								content={(models[modelIdx]?.info?.meta?.tags ?? [])
 									.map((tag) => tag.name.toUpperCase())
 									.join(', ')}
@@ -120,7 +120,7 @@
 										selectedModelIdx = modelIdx;
 									}}
 								>
-									<!-- <img
+									<img
 										crossorigin="anonymous"
 										src={model?.info?.meta?.profile_image_url ??
 											($i18n.language === 'dg-DG'
@@ -129,9 +129,9 @@
 										class=" size-9 @sm:size-10 rounded-full border-[1px] border-gray-100 dark:border-none"
 										alt="logo"
 										draggable="false"
-									/> -->
+									/>
 								</button>
-							</Tooltip>
+							</Tooltip> -->
 						{/each}
 					</div>
 				</div>
@@ -148,7 +148,7 @@
 			<div class="flex mt-1 mb-2">
 				<div in:fade={{ duration: 100, delay: 50 }}>
 					{#if models[selectedModelIdx]?.info?.meta?.description ?? null}
-						<Tooltip
+						<!-- <Tooltip
 							className=" w-fit"
 							content={marked.parse(
 								sanitizeResponseContent(models[selectedModelIdx]?.info?.meta?.description ?? '')
@@ -162,7 +162,7 @@
 									sanitizeResponseContent(models[selectedModelIdx]?.info?.meta?.description)
 								)}
 							</div>
-						</Tooltip>
+						</Tooltip> -->
 
 						{#if models[selectedModelIdx]?.info?.meta?.user}
 							<div class="mt-0.5 text-sm font-normal text-gray-400 dark:text-gray-500">

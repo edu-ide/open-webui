@@ -48,7 +48,6 @@
 	import NotificationToast from '$lib/components/NotificationToast.svelte';
 	import AppSidebar from '$lib/components/app/AppSidebar.svelte';
 	import { chatCompletion } from '$lib/apis/openai';
-	import { accessToken } from '$lib/stores/accessToken';
 
 	onMount(() => {
 		function handleMessage(event: MessageEvent) {
@@ -56,7 +55,7 @@
 			// if (event.origin !== 'http://localhost:5173') return;
 			if (event.data?.type === 'AUTH_TOKEN' && event.data.token) {
 				console.log('AUTH_TOKEN', event.data.token);
-				accessToken.set(event.data.token);
+				localStorage.token = event.data.token;
 				// 필요하다면 localStorage 등에 저장 가능
 			}
 		}

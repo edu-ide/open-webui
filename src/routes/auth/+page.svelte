@@ -16,7 +16,6 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import OnBoarding from '$lib/components/OnBoarding.svelte';
 
-	import { accessToken } from '$lib/stores/accessToken';
 
 	const i18n = getContext('i18n');
 
@@ -53,22 +52,59 @@
 	};
 
 	const signInHandler = async () => {
-		let tokenValue;
-		const unsubscribe = accessToken.subscribe((v) => { tokenValue = v });
-		let sessionUser;
-		if (tokenValue) {
-			sessionUser = await tokenAuth(tokenValue).catch((error) => {
-				toast.error(`${error}`);
-				return null;
-			});
-		} else {
-			sessionUser = await userSignIn(email, password).catch((error) => {
-				toast.error(`${error}`);
-				return null;
-			});
+		let sessionUser = null;
+
+		if ($config?.features.auth_trusted_header) {
+			console.log('Attempting sign-in via trusted header...');
+			try {
+				// 예시: trusted header를 통해 인증된 사용자 정보를 가져오는 API 호출
+				// sessionUser = await getSessionUserViaTrustedHeader(); // 이 함수는 새로 정의해야 할 수 있습니다.
+				// 또는, getSessionUser()가 쿠키 기반 세션을 처리할 수 있다면 이를 사용합니다.
+				// 현재 getSessionUser는 토큰을 인자로 받으므로, 수정이 필요할 수 있습니다.
+				// 여기서는 임시로 getSessionUser() 호출을 시도한다고 가정합니다.
+				sessionUser = await getSessionUser(undefined).catch((error) => { // getSessionUser가 토큰 없이 호출 가능하도록 수정되었다고 가정
+					toast.error($i18n.t('Trusted header sign-in failed: {{error}}', { error }));
+					return null;
+				});
+			} catch (error) {
+				toast.error($i18n.t('Error during trusted header sign-in: {{error}}', { error }));
+			}
+		} else if ($config?.features.auth === false) {
+			console.log('Authentication is disabled, attempting to get/create guest session...');
+			try {
+				// 예시: 인증이 비활성화된 경우 사용할 사용자 정보를 가져오는 API 호출
+				// sessionUser = await getGuestUserSession(); // 이 함수는 새로 정의해야 할 수 있습니다.
+				// 임시로, 이 경로에 대한 구현이 필요함을 알립니다.
+				toast.info($i18n.t('Sign-in not required. Guest session setup needed.'));
+				// 실제로는 여기서 guest 사용자 정보를 sessionUser에 할당해야 합니다.
+			} catch (error) {
+				toast.error($i18n.t('Error setting up guest session: {{error}}', { error }));
+			}
 		}
-		unsubscribe();
-		await setSessionUser(sessionUser);
+
+		// 위 조건에 해당하지 않거나, 위에서 sessionUser를 가져오지 못한 경우 localStorage 토큰 시도
+		if (!sessionUser) {
+			const tokenValue = localStorage.token;
+			if (tokenValue) {
+				console.log('Attempting sign-in via localStorage token...');
+				sessionUser = await tokenAuth(tokenValue).catch((error) => {
+					toast.error(`${error}`); // tokenAuth에서 이미 에러 토스트를 띄울 수 있습니다.
+					return null;
+				});
+			}
+		}
+
+		if (sessionUser) {
+			await setSessionUser(sessionUser);
+		} else {
+			// 모든 자동 로그인 시도 실패 시
+			toast.error($i18n.t('Automatic sign-in failed. Please sign in manually.'));
+			// 여기서 "Signing in..." UI를 숨기고 수동 로그인 폼을 보여주는 로직 추가가 이상적입니다.
+			// 예를 들어, 'mode'를 'signin'으로 변경하거나, 'loaded' 상태와 연동된 다른 상태를 변경하여 UI 전환.
+			// 현재 구조에서는 onMount에서 이미 UI 모드가 결정되어 어려울 수 있으므로,
+			// 상태 관리를 통해 로그인 폼으로 전환하는 로직이 필요합니다.
+			// 간단한 예시: mode = 'signin'; onboarding = false; (UI가 이에 반응하도록 설계되어야 함)
+		}
 	};
 
 	const signUpHandler = async () => {
