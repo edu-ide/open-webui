@@ -89,7 +89,7 @@ from open_webui.routers.retrieval import (
 from open_webui.internal.db import Session, engine
 
 from open_webui.models.functions import Functions
-from open_webui.models.models import Models
+from open_webui.models.models import Models, ModelForm, ModelParams, ModelMeta
 from open_webui.models.users import UserModel, Users
 from open_webui.models.chats import Chats
 
@@ -451,6 +451,119 @@ https://github.com/open-webui/open-webui
 )
 
 
+def add_initial_grok_model_on_startup():
+    model_id = "grok-3-beta"
+    model_name = "grok-3-beta" 
+
+    admin_user_id: Optional[str] = None
+    admin_email_val = ADMIN_EMAIL.value 
+    if admin_email_val:
+        admin_user = Users.get_user_by_email(admin_email_val)
+        if admin_user:
+            admin_user_id = admin_user.id
+        else:
+            log.warning(f"Admin user with email '{admin_email_val}' not found for initial Grok model setup.")
+    
+    if not admin_user_id:
+        users_data = Users.get_users() # 이제 {'users': [UserModel, ...]} 형태를 기대합니다.
+        if isinstance(users_data, dict) and 'users' in users_data and isinstance(users_data['users'], list):
+            actual_users_list = users_data['users']
+            admin_users_list = [user for user in actual_users_list if hasattr(user, 'role') and user.role == "admin"]
+            if admin_users_list:
+                admin_user_id = admin_users_list[0].id
+                log.info(f"Found admin user '{admin_users_list[0].email}' (ID: {admin_user_id}) for initial Grok model setup.")
+            else:
+                log.warning("No admin user found (after checking all users). Initial Grok model will not be added as it requires an owner. Skipping model addition.")
+                return
+
+    if Models.get_model_by_id(model_id):
+        log.info(f"Initial model '{model_id}' already exists in the database.")
+        # 모델이 이미 존재하면 DEFAULT_MODELS에 있는지 확인하고 추가하는 로직 (선택적)
+        current_default_models_str = DEFAULT_MODELS.value if DEFAULT_MODELS.value else ""
+        current_default_models_list = [m.strip() for m in current_default_models_str.split(";") if m.strip()]
+        if model_id not in current_default_models_list:
+            current_default_models_list.append(model_id)
+            DEFAULT_MODELS.value = ";".join(current_default_models_list)
+            DEFAULT_MODELS.save()
+            log.info(f"Ensured '{model_id}' is in DEFAULT_MODELS: {DEFAULT_MODELS.value}")
+        return
+
+    log.info(f"Attempting to add initial model '{model_id}' for user ID '{admin_user_id}'.")
+    
+    target_api_base_url = None
+    # url_idx_for_model = -1 # Models.insert_new_model에서 base_model 파싱하여 url_idx 결정
+
+    if OPENAI_API_CONFIGS.value and isinstance(OPENAI_API_CONFIGS.value, dict):
+        for idx_str, config_details in OPENAI_API_CONFIGS.value.items():
+            if isinstance(config_details, dict) and \
+               config_details.get("enable", False) and \
+               model_id in config_details.get("model_ids", []):
+                try:
+                    parsed_idx = int(idx_str)
+                    if 0 <= parsed_idx < len(OPENAI_API_BASE_URLS.value):
+                        target_api_base_url = OPENAI_API_BASE_URLS.value[parsed_idx]
+                        # url_idx_for_model = parsed_idx
+                        log.info(f"Found target API base URL '{target_api_base_url}' for model '{model_id}' at index {parsed_idx}.")
+                        break 
+                    else:
+                        log.warning(f"Index {parsed_idx} from OPENAI_API_CONFIGS for model '{model_id}' is out of range for OPENAI_API_BASE_URLS.")
+                except ValueError:
+                    log.warning(f"Could not parse index '{idx_str}' from OPENAI_API_CONFIGS for model '{model_id}'.")
+                
+                if target_api_base_url is None: # 현재 config_details에서 유효한 URL을 못 찾았으면 다음 config_details 확인
+                    # url_idx_for_model = -1
+                    pass
+    
+    if not target_api_base_url:
+        log.warning(f"Could not determine a valid and enabled target API base URL for model '{model_id}' from OPENAI_API_CONFIGS. Model will not be added.")
+        return
+
+    logo_filename = "xai_grok_logo.png" 
+    logo_path_in_static = STATIC_DIR / logo_filename 
+    
+    if not logo_path_in_static.exists():
+        log.warning(f"Profile image '{logo_filename}' not found in '{STATIC_DIR}'. Using default favicon.")
+        profile_image_url = f"{WEBUI_URL.value}/static/favicon.png"
+    else:
+        profile_image_url = f"{WEBUI_URL.value}/static/{logo_filename}"
+
+    form_data = ModelForm(
+        id=model_id,
+        name=model_name,
+        base_model_id=model_id, 
+        base_model=f"openai:{target_api_base_url}", 
+        params=ModelParams( 
+            max_tokens=32768, 
+            temperature=0.7,
+            top_p=1.0,
+            stream=True,
+        ),
+        meta=ModelMeta( 
+            profile_image_url=profile_image_url,
+            description="Grok-3 Beta model by xAI. Large language model for advanced reasoning and coding.",
+            tags=[{"name": "xai"}, {"name": "grok"}, {"name": "beta"}, {"name": "reasoning"}, {"name": "coding"}],
+        ),
+    )
+
+    try:
+        Models.insert_new_model(user_id=admin_user_id, form_data=form_data)
+        log.info(f"Successfully added initial model '{model_id}' for admin user '{admin_user_id}' and API URL '{target_api_base_url}'.")
+
+        current_default_models_str = DEFAULT_MODELS.value if DEFAULT_MODELS.value else ""
+        current_default_models_list = [m.strip() for m in current_default_models_str.split(";") if m.strip()]
+        
+        if model_id not in current_default_models_list:
+            current_default_models_list.append(model_id)
+            DEFAULT_MODELS.value = ";".join(current_default_models_list)
+            DEFAULT_MODELS.save()
+            log.info(f"Updated DEFAULT_MODELS: {DEFAULT_MODELS.value}")
+        else:
+            log.info(f"'{model_id}' already in DEFAULT_MODELS.")
+
+    except Exception as e:
+        log.error(f"Failed to add initial model '{model_id}': {e}", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     start_logger()
@@ -464,6 +577,13 @@ async def lifespan(app: FastAPI):
     # when the first user lands on the / route.
     log.info("Installing external dependencies of functions and tools...")
     install_tool_and_function_dependencies()
+
+    # Grok 모델 추가 시도
+    try:
+        add_initial_grok_model_on_startup()
+    except Exception as e:
+        log.error(f"Error during add_initial_grok_model_on_startup: {e}", exc_info=True)
+
 
     if THREAD_POOL_SIZE and THREAD_POOL_SIZE > 0:
         limiter = anyio.to_thread.current_default_thread_limiter()
@@ -1353,13 +1473,13 @@ async def get_app_config(request: Request):
             }
         },
         "features": {
-            "auth": WEBUI_AUTH,
-            "auth_trusted_header": bool(app.state.AUTH_TRUSTED_EMAIL_HEADER),
-            "enable_ldap": app.state.config.ENABLE_LDAP,
-            "enable_api_key": app.state.config.ENABLE_API_KEY,
-            "enable_signup": app.state.config.ENABLE_SIGNUP,
-            "enable_login_form": app.state.config.ENABLE_LOGIN_FORM,
-            "enable_websocket": ENABLE_WEBSOCKET_SUPPORT,
+            "auth": True,
+            "auth_trusted_header": True,
+            "enable_ldap": False,
+            "enable_api_key": False,
+            "enable_signup": False,
+            "enable_login_form": False,
+            "enable_websocket": True,
             **(
                 {
                     "enable_direct_connections": app.state.config.ENABLE_DIRECT_CONNECTIONS,

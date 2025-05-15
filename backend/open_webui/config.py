@@ -840,31 +840,68 @@ GEMINI_API_BASE_URL = os.environ.get("GEMINI_API_BASE_URL", "")
 if OPENAI_API_BASE_URL == "":
     OPENAI_API_BASE_URL = "https://api.openai.com/v1"
 
-OPENAI_API_KEYS = os.environ.get("OPENAI_API_KEYS", "")
-OPENAI_API_KEYS = OPENAI_API_KEYS if OPENAI_API_KEYS != "" else OPENAI_API_KEY
+# Prepare OPENAI_API_KEYS_LIST
+# 환경 변수 우선, 없으면 기본 OpenAI 키와 XAI 키 사용
+_openai_api_keys_env = os.environ.get("OPENAI_API_KEYS", "")
+# 예: "sk-myopenaikey;xai-myxaikey"
+OPENAI_API_KEYS_LIST_FROM_ENV = [key.strip() for key in _openai_api_keys_env.split(";") if key.strip()]
 
-OPENAI_API_KEYS = [url.strip() for url in OPENAI_API_KEYS.split(";")]
+if OPENAI_API_KEYS_LIST_FROM_ENV:
+    OPENAI_API_KEYS_LIST = OPENAI_API_KEYS_LIST_FROM_ENV
+else:
+    OPENAI_API_KEYS_LIST = [
+        os.environ.get("OPENAI_API_KEY", "sk-proj-1234567890"),  # 기본 OpenAI API 키
+        os.environ.get("XAI_API_KEY", "")
+    ]
+# 빈 문자열 키 제거
+OPENAI_API_KEYS_LIST = [key for key in OPENAI_API_KEYS_LIST if key]
+
+
 OPENAI_API_KEYS = PersistentConfig(
-    "OPENAI_API_KEYS", "openai.api_keys", OPENAI_API_KEYS
+    "OPENAI_API_KEYS", "openai.api_keys", OPENAI_API_KEYS_LIST
 )
 
-OPENAI_API_BASE_URLS = os.environ.get("OPENAI_API_BASE_URLS", "")
-OPENAI_API_BASE_URLS = (
-    OPENAI_API_BASE_URLS if OPENAI_API_BASE_URLS != "" else OPENAI_API_BASE_URL
-)
+# Prepare OPENAI_API_BASE_URLS_LIST
+# 환경 변수 우선, 없으면 기본 OpenAI URL과 XAI URL 사용
+_openai_api_base_urls_env = os.environ.get("OPENAI_API_BASE_URLS", "")
+# 예: "https://api.openai.com/v1;https://api.grok.xai.com/v1"
+OPENAI_API_BASE_URLS_LIST_FROM_ENV = [url.strip() for url in _openai_api_base_urls_env.split(";") if url.strip()]
 
-OPENAI_API_BASE_URLS = [
-    url.strip() if url != "" else "https://api.openai.com/v1"
-    for url in OPENAI_API_BASE_URLS.split(";")
-]
+if OPENAI_API_BASE_URLS_LIST_FROM_ENV:
+    OPENAI_API_BASE_URLS_LIST = OPENAI_API_BASE_URLS_LIST_FROM_ENV
+else:
+    OPENAI_API_BASE_URLS_LIST = [
+        os.environ.get("XAI_API_BASE_URL", "https://api.x.ai/v1"), # Grok Base URL
+        os.environ.get("OPENAI_API_BASE_URL", "https://api.openai.com/v1"), # 기본 OpenAI Base URL
+    ]
+# 빈 문자열 URL을 OpenAI 기본 URL로 대체하거나 제거 (여기서는 기본 URL로 대체)
+OPENAI_API_BASE_URLS_LIST = [url if url else "https://api.openai.com/v1" for url in OPENAI_API_BASE_URLS_LIST]
+
+
 OPENAI_API_BASE_URLS = PersistentConfig(
-    "OPENAI_API_BASE_URLS", "openai.api_base_urls", OPENAI_API_BASE_URLS
+    "OPENAI_API_BASE_URLS", "openai.api_base_urls", OPENAI_API_BASE_URLS_LIST
 )
+
+# OPENAI_API_CONFIGS 설정
+# XAI URL이 OPENAI_API_BASE_URLS_LIST의 몇 번째 인덱스에 있는지 확인 후 설정
+xai_url_index = -1
+try:
+    xai_url_index = OPENAI_API_BASE_URLS.value.index("https://api.x.ai/v1")
+except ValueError:
+    log.warning("XAI Base URL ('https://api.x.ai/v1') not found in OPENAI_API_BASE_URLS_LIST. XAI models may not be loaded correctly via config.")
+
+api_configs_dict = {}
+if xai_url_index != -1:
+    api_configs_dict[str(xai_url_index)] = {
+        "enable": True,
+        "model_ids": ["grok-3-beta"],
+    }
+# 다른 OpenAI URL에 대한 설정이 있다면 여기에 추가 (예: "0": {"enable": True, "tags": ["gpt"]})
 
 OPENAI_API_CONFIGS = PersistentConfig(
     "OPENAI_API_CONFIGS",
     "openai.api_configs",
-    {},
+    api_configs_dict,
 )
 
 # Get the actual OpenAI API key based on the base URL
