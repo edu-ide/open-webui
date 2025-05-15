@@ -1,9 +1,10 @@
-<script>
+<script lang="ts">
 	import { toast } from 'svelte-sonner';
 
 	import { onMount, getContext, tick } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
+	import { derived, get } from 'svelte/store';
 
 	import { getBackendConfig } from '$lib/apis';
 	import { ldapUserSignIn, getSessionUser, userSignIn, userSignUp, tokenAuth } from '$lib/apis/auths';
@@ -16,12 +17,24 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import OnBoarding from '$lib/components/OnBoarding.svelte';
 
+	// i18n 컨텍스트를 위한 임시 인터페이스 정의
+	interface I18nContext {
+		t: (key: string, vars?: Record<string, any>) => string;
+		// locale, locales 등 다른 속성/메소드가 있다면 여기에 추가할 수 있습니다.
+	}
 
-	const i18n = getContext('i18n');
+	const i18n = getContext<I18nContext>('i18n'); // 타입 명시
 
 	let loaded = false;
+	let onboarding = false;
 
-	let mode = $config?.features.enable_ldap ? 'ldap' : 'signin';
+	const showOnboarding = derived(config, ($c) => ($c as any)?.onboarding ?? false);
+	const features = derived(config, ($c) => ($c as any)?.features ?? {});
+	const enableLdap = derived(features, ($f) => $f?.enable_ldap ?? false);
+	const enableLoginForm = derived(features, ($f) => $f?.enable_login_form ?? false);
+	const enableSignup = derived(features, ($f) => $f?.enable_signup ?? false);
+
+	let mode = get(enableLdap) ? 'ldap' : 'signin';
 
 	let name = '';
 	let email = '';
@@ -38,7 +51,7 @@
 	const setSessionUser = async (sessionUser) => {
 		if (sessionUser) {
 			console.log(sessionUser);
-			toast.success($i18n.t(`You're now logged in.`));
+			toast.success(i18n.t(`You're now logged in.`));
 			if (sessionUser.token) {
 				localStorage.token = sessionUser.token;
 			}
@@ -51,44 +64,61 @@
 		}
 	};
 
+	const handleAuthMessage = (event) => {
+		if (event.data && event.data.type === 'AUTH_TOKEN' && event.data.token) {
+			console.log('[Open WebUI] Received auth token via postMessage:', event.data.token);
+			localStorage.token = event.data.token;
+
+			tokenAuth(event.data.token)
+				.then(sessionUserFromToken => {
+					if (sessionUserFromToken) {
+						return setSessionUser(sessionUserFromToken);
+					}
+					return Promise.resolve(null);
+				})
+				.catch(error => {
+					console.error('[Open WebUI] Token authentication failed:', error);
+					return Promise.resolve(null);
+				})
+				.then(processedUser => {
+					if (!processedUser) {
+						// console.log('[Open WebUI] Token auth or setSessionUser failed');
+					}
+				})
+				.catch(error => {
+					console.error('[Open WebUI] Error during setSessionUser after token auth:', error);
+				});
+		}
+	};
+
 	const signInHandler = async () => {
 		let sessionUser = null;
 
-		if ($config?.features.auth_trusted_header) {
+		if (get(features)?.auth_trusted_header ?? false) {
 			console.log('Attempting sign-in via trusted header...');
 			try {
-				// 예시: trusted header를 통해 인증된 사용자 정보를 가져오는 API 호출
-				// sessionUser = await getSessionUserViaTrustedHeader(); // 이 함수는 새로 정의해야 할 수 있습니다.
-				// 또는, getSessionUser()가 쿠키 기반 세션을 처리할 수 있다면 이를 사용합니다.
-				// 현재 getSessionUser는 토큰을 인자로 받으므로, 수정이 필요할 수 있습니다.
-				// 여기서는 임시로 getSessionUser() 호출을 시도한다고 가정합니다.
-				sessionUser = await getSessionUser(undefined).catch((error) => { // getSessionUser가 토큰 없이 호출 가능하도록 수정되었다고 가정
-					toast.error($i18n.t('Trusted header sign-in failed: {{error}}', { error }));
+				sessionUser = await getSessionUser(undefined).catch((error) => {
+					toast.error(i18n.t('Trusted header sign-in failed: {{error}}', { error }));
 					return null;
 				});
 			} catch (error) {
-				toast.error($i18n.t('Error during trusted header sign-in: {{error}}', { error }));
+				toast.error(i18n.t('Error during trusted header sign-in: {{error}}', { error }));
 			}
-		} else if ($config?.features.auth === false) {
+		} else if (get(features)?.auth === false) {
 			console.log('Authentication is disabled, attempting to get/create guest session...');
 			try {
-				// 예시: 인증이 비활성화된 경우 사용할 사용자 정보를 가져오는 API 호출
-				// sessionUser = await getGuestUserSession(); // 이 함수는 새로 정의해야 할 수 있습니다.
-				// 임시로, 이 경로에 대한 구현이 필요함을 알립니다.
-				toast.info($i18n.t('Sign-in not required. Guest session setup needed.'));
-				// 실제로는 여기서 guest 사용자 정보를 sessionUser에 할당해야 합니다.
+				toast.info(i18n.t('Sign-in not required. Guest session setup needed.'));
 			} catch (error) {
-				toast.error($i18n.t('Error setting up guest session: {{error}}', { error }));
+				toast.error(i18n.t('Error setting up guest session: {{error}}', { error }));
 			}
 		}
 
-		// 위 조건에 해당하지 않거나, 위에서 sessionUser를 가져오지 못한 경우 localStorage 토큰 시도
 		if (!sessionUser) {
 			const tokenValue = localStorage.token;
 			if (tokenValue) {
 				console.log('Attempting sign-in via localStorage token...');
 				sessionUser = await tokenAuth(tokenValue).catch((error) => {
-					toast.error(`${error}`); // tokenAuth에서 이미 에러 토스트를 띄울 수 있습니다.
+					toast.error(`${error}`);
 					return null;
 				});
 			}
@@ -97,13 +127,7 @@
 		if (sessionUser) {
 			await setSessionUser(sessionUser);
 		} else {
-			// 모든 자동 로그인 시도 실패 시
-			toast.error($i18n.t('Automatic sign-in failed. Please sign in manually.'));
-			// 여기서 "Signing in..." UI를 숨기고 수동 로그인 폼을 보여주는 로직 추가가 이상적입니다.
-			// 예를 들어, 'mode'를 'signin'으로 변경하거나, 'loaded' 상태와 연동된 다른 상태를 변경하여 UI 전환.
-			// 현재 구조에서는 onMount에서 이미 UI 모드가 결정되어 어려울 수 있으므로,
-			// 상태 관리를 통해 로그인 폼으로 전환하는 로직이 필요합니다.
-			// 간단한 예시: mode = 'signin'; onboarding = false; (UI가 이에 반응하도록 설계되어야 함)
+			// toast.error($i18n.t('Automatic sign-in failed. Please sign in manually.'));
 		}
 	};
 
@@ -160,11 +184,53 @@
 		await setSessionUser(sessionUser);
 	};
 
-	let onboarding = false;
+	onMount(() => {
+		const init = async () => {
+			if ($user !== undefined) {
+				const redirectPath = querystringValue('redirect') || '/';
+				goto(redirectPath);
+				return;
+			}
+			await checkOauthCallback();
+
+			loaded = true;
+			await setLogoImage();
+
+			if ((get(features)?.auth_trusted_header ?? false) || (get(features)?.auth === false)) {
+				await signInHandler();
+			} else {
+				onboarding = get(showOnboarding);
+			}
+		};
+
+		init().catch(error => {
+			console.error("[Open WebUI] Error during onMount initialization:", error);
+		});
+
+		const unsubscribeShowOnboarding = showOnboarding.subscribe(value => {
+			onboarding = value;
+		});
+
+		const unsubscribeEnableLdap = enableLdap.subscribe(value => {
+			// 이 로직은 mode의 초기화 이후에 mode가 동적으로 변경되어야 할 때 필요합니다.
+			// 현재 mode는 로그인/가입 폼의 상태를 나타내므로, 사용자의 인터랙션으로 주로 변경됩니다.
+			// 만약 config 변경에 따라 mode가 자동으로 바뀌어야 한다면 이 구독 로직이 유효합니다.
+			// 지금은 초기화 이후 사용자가 직접 mode를 바꾸므로, 이 구독은 주석 처리하거나 제거 가능
+			// mode = value ? 'ldap' : 'signin'; 
+		});
+
+		window.addEventListener('message', handleAuthMessage);
+
+		return () => {
+			window.removeEventListener('message', handleAuthMessage);
+			unsubscribeShowOnboarding();
+			unsubscribeEnableLdap();
+		};
+	});
 
 	async function setLogoImage() {
 		await tick();
-		const logo = document.getElementById('logo');
+		const logo = document.getElementById('logo') as HTMLImageElement;
 
 		if (logo) {
 			const isDarkMode = document.documentElement.classList.contains('dark');
@@ -175,32 +241,15 @@
 
 				darkImage.onload = () => {
 					logo.src = '/static/favicon-dark.png';
-					logo.style.filter = ''; // Ensure no inversion is applied if favicon-dark.png exists
+					logo.style.filter = '';
 				};
 
 				darkImage.onerror = () => {
-					logo.style.filter = 'invert(1)'; // Invert image if favicon-dark.png is missing
+					logo.style.filter = 'invert(1)';
 				};
 			}
 		}
 	}
-
-	onMount(async () => {
-		if ($user !== undefined) {
-			const redirectPath = querystringValue('redirect') || '/';
-			goto(redirectPath);
-		}
-		await checkOauthCallback();
-
-		loaded = true;
-		setLogoImage();
-
-		if (($config?.features.auth_trusted_header ?? false) || $config?.features.auth === false) {
-			await signInHandler();
-		} else {
-			onboarding = $config?.onboarding ?? false;
-		}
-	});
 </script>
 
 <svelte:head>
@@ -213,7 +262,7 @@
 	bind:show={onboarding}
 	getStartedHandler={() => {
 		onboarding = false;
-		mode = $config?.features.enable_ldap ? 'ldap' : 'signup';
+		mode = $enableLdap ? 'ldap' : 'signup';
 	}}
 />
 
@@ -241,13 +290,13 @@
 			class="fixed bg-transparent min-h-screen w-full flex justify-center font-primary z-50 text-black dark:text-white"
 		>
 			<div class="w-full sm:max-w-md px-10 min-h-screen flex flex-col text-center">
-				{#if ($config?.features.auth_trusted_header ?? false) || $config?.features.auth === false}
+				{#if ($features?.auth_trusted_header ?? false) || ($features?.auth === false)}
 					<div class=" my-auto pb-10 w-full">
 						<div
 							class="flex items-center justify-center gap-3 text-xl sm:text-2xl text-center font-semibold dark:text-gray-200"
 						>
 							<div>
-								{$i18n.t('Signing in to {{WEBUI_NAME}}', { WEBUI_NAME: $WEBUI_NAME })}
+								{i18n.t('Signing in to {{WEBUI_NAME}}', { WEBUI_NAME: $WEBUI_NAME })}
 							</div>
 
 							<div>
@@ -266,33 +315,33 @@
 						>
 							<div class="mb-1">
 								<div class=" text-2xl font-medium">
-									{#if $config?.onboarding ?? false}
-										{$i18n.t(`Get started with {{WEBUI_NAME}}`, { WEBUI_NAME: $WEBUI_NAME })}
+									{#if $showOnboarding}
+										{i18n.t(`Get started with {{WEBUI_NAME}}`, { WEBUI_NAME: $WEBUI_NAME })}
 									{:else if mode === 'ldap'}
-										{$i18n.t(`Sign in to {{WEBUI_NAME}} with LDAP`, { WEBUI_NAME: $WEBUI_NAME })}
+										{i18n.t(`Sign in to {{WEBUI_NAME}} with LDAP`, { WEBUI_NAME: $WEBUI_NAME })}
 									{:else if mode === 'signin'}
-										{$i18n.t(`Sign in to {{WEBUI_NAME}}`, { WEBUI_NAME: $WEBUI_NAME })}
+										{i18n.t(`Sign in to {{WEBUI_NAME}}`, { WEBUI_NAME: $WEBUI_NAME })}
 									{:else}
-										{$i18n.t(`Sign up to {{WEBUI_NAME}}`, { WEBUI_NAME: $WEBUI_NAME })}
+										{i18n.t(`Sign up to {{WEBUI_NAME}}`, { WEBUI_NAME: $WEBUI_NAME })}
 									{/if}
 								</div>
 
-								{#if $config?.onboarding ?? false}
+								{#if $showOnboarding}
 									<div class="mt-1 text-xs font-medium text-gray-600 dark:text-gray-500">
 										ⓘ {$WEBUI_NAME}
-										{$i18n.t(
+										{i18n.t(
 											'does not make any external connections, and your data stays securely on your locally hosted server.'
 										)}
 									</div>
 								{/if}
 							</div>
 
-							{#if $config?.features.enable_login_form || $config?.features.enable_ldap}
+							{#if ($enableLoginForm || $enableLdap)}
 								<div class="flex flex-col mt-4">
 									{#if mode === 'signup'}
 										<div class="mb-2">
 											<label for="name" class="text-sm font-medium text-left mb-1 block"
-												>{$i18n.t('Name')}</label
+												>{i18n.t('Name')}</label
 											>
 											<input
 												bind:value={name}
@@ -300,7 +349,7 @@
 												id="name"
 												class="my-0.5 w-full text-sm outline-hidden bg-transparent"
 												autocomplete="name"
-												placeholder={$i18n.t('Enter Your Full Name')}
+												placeholder={i18n.t('Enter Your Full Name')}
 												required
 											/>
 										</div>
@@ -309,7 +358,7 @@
 									{#if mode === 'ldap'}
 										<div class="mb-2">
 											<label for="username" class="text-sm font-medium text-left mb-1 block"
-												>{$i18n.t('Username')}</label
+												>{i18n.t('Username')}</label
 											>
 											<input
 												bind:value={ldapUsername}
@@ -318,14 +367,14 @@
 												autocomplete="username"
 												name="username"
 												id="username"
-												placeholder={$i18n.t('Enter Your Username')}
+												placeholder={i18n.t('Enter Your Username')}
 												required
 											/>
 										</div>
 									{:else}
 										<div class="mb-2">
 											<label for="email" class="text-sm font-medium text-left mb-1 block"
-												>{$i18n.t('Email')}</label
+												>{i18n.t('Email')}</label
 											>
 											<input
 												bind:value={email}
@@ -334,7 +383,7 @@
 												class="my-0.5 w-full text-sm outline-hidden bg-transparent"
 												autocomplete="email"
 												name="email"
-												placeholder={$i18n.t('Enter Your Email')}
+												placeholder={i18n.t('Enter Your Email')}
 												required
 											/>
 										</div>
@@ -342,14 +391,14 @@
 
 									<div>
 										<label for="password" class="text-sm font-medium text-left mb-1 block"
-											>{$i18n.t('Password')}</label
+											>{i18n.t('Password')}</label
 										>
 										<input
 											bind:value={password}
 											type="password"
 											id="password"
 											class="my-0.5 w-full text-sm outline-hidden bg-transparent"
-											placeholder={$i18n.t('Enter Your Password')}
+											placeholder={i18n.t('Enter Your Password')}
 											autocomplete="current-password"
 											name="current-password"
 											required
@@ -358,13 +407,13 @@
 								</div>
 							{/if}
 							<div class="mt-5">
-								{#if $config?.features.enable_login_form || $config?.features.enable_ldap}
+								{#if ($enableLoginForm || $enableLdap)}
 									{#if mode === 'ldap'}
 										<button
 											class="bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
 											type="submit"
 										>
-											{$i18n.t('Authenticate')}
+											{i18n.t('Authenticate')}
 										</button>
 									{:else}
 										<button
@@ -372,17 +421,17 @@
 											type="submit"
 										>
 											{mode === 'signin'
-												? $i18n.t('Sign in')
-												: ($config?.onboarding ?? false)
-													? $i18n.t('Create Admin Account')
-													: $i18n.t('Create Account')}
+												? i18n.t('Sign in')
+												: $showOnboarding
+													? i18n.t('Create Admin Account')
+													: i18n.t('Create Account')}
 										</button>
 
-										{#if $config?.features.enable_signup && !($config?.onboarding ?? false)}
+										{#if $enableSignup && !$showOnboarding}
 											<div class=" mt-4 text-sm text-center">
 												{mode === 'signin'
-													? $i18n.t("Don't have an account?")
-													: $i18n.t('Already have an account?')}
+													? i18n.t("Don't have an account?")
+													: i18n.t('Already have an account?')}
 
 												<button
 													class=" font-medium underline"
@@ -395,7 +444,7 @@
 														}
 													}}
 												>
-													{mode === 'signin' ? $i18n.t('Sign up') : $i18n.t('Sign in')}
+													{mode === 'signin' ? i18n.t('Sign up') : i18n.t('Sign in')}
 												</button>
 											</div>
 										{/if}
@@ -404,20 +453,20 @@
 							</div>
 						</form>
 
-						{#if Object.keys($config?.oauth?.providers ?? {}).length > 0}
+						{#if Object.keys($features?.oauth?.providers ?? {}).length > 0}
 							<div class="inline-flex items-center justify-center w-full">
 								<hr class="w-32 h-px my-4 border-0 dark:bg-gray-100/10 bg-gray-700/10" />
-								{#if $config?.features.enable_login_form || $config?.features.enable_ldap}
+								{#if ($enableLoginForm || $enableLdap)}
 									<span
 										class="px-3 text-sm font-medium text-gray-900 dark:text-white bg-transparent"
-										>{$i18n.t('or')}</span
+										>{i18n.t('or')}</span
 									>
 								{/if}
 
 								<hr class="w-32 h-px my-4 border-0 dark:bg-gray-100/10 bg-gray-700/10" />
 							</div>
 							<div class="flex flex-col space-y-2">
-								{#if $config?.oauth?.providers?.google}
+								{#if ($features?.oauth?.providers?.google)}
 									<button
 										class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
 										on:click={() => {
@@ -439,10 +488,10 @@
 												d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
 											/><path fill="none" d="M0 0h48v48H0z" />
 										</svg>
-										<span>{$i18n.t('Continue with {{provider}}', { provider: 'Google' })}</span>
+										<span>{i18n.t('Continue with {{provider}}', { provider: 'Google' })}</span>
 									</button>
 								{/if}
-								{#if $config?.oauth?.providers?.microsoft}
+								{#if ($features?.oauth?.providers?.microsoft)}
 									<button
 										class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
 										on:click={() => {
@@ -464,10 +513,10 @@
 												fill="#ffb900"
 											/>
 										</svg>
-										<span>{$i18n.t('Continue with {{provider}}', { provider: 'Microsoft' })}</span>
+										<span>{i18n.t('Continue with {{provider}}', { provider: 'Microsoft' })}</span>
 									</button>
 								{/if}
-								{#if $config?.oauth?.providers?.github}
+								{#if ($features?.oauth?.providers?.github)}
 									<button
 										class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
 										on:click={() => {
@@ -480,10 +529,10 @@
 												d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.92 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57C20.565 21.795 24 17.31 24 12c0-6.63-5.37-12-12-12z"
 											/>
 										</svg>
-										<span>{$i18n.t('Continue with {{provider}}', { provider: 'GitHub' })}</span>
+										<span>{i18n.t('Continue with {{provider}}', { provider: 'GitHub' })}</span>
 									</button>
 								{/if}
-								{#if $config?.oauth?.providers?.oidc}
+								{#if ($features?.oauth?.providers?.oidc)}
 									<button
 										class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
 										on:click={() => {
@@ -506,8 +555,8 @@
 										</svg>
 
 										<span
-											>{$i18n.t('Continue with {{provider}}', {
-												provider: $config?.oauth?.providers?.oidc ?? 'SSO'
+											>{i18n.t('Continue with {{provider}}', {
+												provider: $features?.oauth?.providers?.oidc ?? 'SSO'
 											})}</span
 										>
 									</button>
@@ -515,21 +564,21 @@
 							</div>
 						{/if}
 
-						{#if $config?.features.enable_ldap && $config?.features.enable_login_form}
+						{#if $enableLdap && $enableLoginForm}
 							<div class="mt-2">
 								<button
 									class="flex justify-center items-center text-xs w-full text-center underline"
 									type="button"
 									on:click={() => {
 										if (mode === 'ldap')
-											mode = ($config?.onboarding ?? false) ? 'signup' : 'signin';
+											mode = $showOnboarding ? 'signup' : 'signin';
 										else mode = 'ldap';
 									}}
 								>
 									<span
 										>{mode === 'ldap'
-											? $i18n.t('Continue with Email')
-											: $i18n.t('Continue with LDAP')}</span
+											? i18n.t('Continue with Email')
+											: i18n.t('Continue with LDAP')}</span
 									>
 								</button>
 							</div>
