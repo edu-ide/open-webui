@@ -21,7 +21,7 @@ jobs:
       - name: Log in to Harbor
         uses: docker/login-action@v3
         with:
-          registry: ${{ secrets.HARBOR_URL }}
+          registry: http://${{ secrets.HARBOR_URL }}
           username: ${{ secrets.HARBOR_USERNAME }}
           password: ${{ secrets.HARBOR_PASSWORD }}
 
@@ -33,8 +33,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ secrets.HARBOR_URL }}/${{ secrets.HARBOR_PROJECT }}/open-webui-backend:${{ env.IMAGE_TAG }}
-            ${{ secrets.HARBOR_URL }}/${{ secrets.HARBOR_PROJECT }}/open-webui-backend:latest
+            http://${{ secrets.HARBOR_URL }}/${{ secrets.HARBOR_PROJECT }}/open-webui-backend:${{ env.IMAGE_TAG }}
+            http://${{ secrets.HARBOR_URL }}/${{ secrets.HARBOR_PROJECT }}/open-webui-backend:latest
 
       - name: Install yq
         run: |
@@ -50,7 +50,7 @@ jobs:
 
       - name: Update values.yaml
         env:
-          IMAGE_PULL_REPOSITORY: ${{ secrets.HARBOR_URL }}/${{ secrets.HARBOR_PROJECT }}/open-webui-backend
+          IMAGE_PULL_REPOSITORY: http://${{ secrets.HARBOR_URL }}/${{ secrets.HARBOR_PROJECT }}/open-webui-backend
           IMAGE_TAG: ${{ env.IMAGE_TAG }}
           SERVICE_NAME: openwebui
         run: |
