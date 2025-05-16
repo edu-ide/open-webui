@@ -18,13 +18,14 @@ jobs:
         id: tag
         run: echo "IMAGE_TAG=$(date +%Y%m%d%H%M%S)-${{ github.run_number }}" >> $GITHUB_ENV
 
-      - name: Log in to Docker Hub
+      - name: Log in to Harbor
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ${{ secrets.HARBOR_URL }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
 
-      - name: Build and push Docker image to Docker Hub
+      - name: Build and push Docker image to Harbor
         uses: docker/build-push-action@v5
         with:
           context: ./backend
@@ -32,8 +33,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/open-webui-backend:${{ env.IMAGE_TAG }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/open-webui-backend:latest
+            ${{ secrets.HARBOR_URL }}/${{ secrets.HARBOR_PROJECT }}/open-webui-backend:${{ env.IMAGE_TAG }}
+            ${{ secrets.HARBOR_URL }}/${{ secrets.HARBOR_PROJECT }}/open-webui-backend:latest
 
       - name: Install yq
         run: |
@@ -43,29 +44,22 @@ jobs:
       - name: Checkout k8s-config Repository
         uses: actions/checkout@v4
         with:
-          repository: edu-ide/k8s-config # 실제 k8s-config 리포지토리 경로
-          path: k8s-config # 클론 받을 로컬 경로
-          token: ${{ secrets.TARGET_REPO_TOKEN }} # k8s-config 리포지토리에 쓰기 권한이 있는 토큰
+          repository: edu-ide/k8s-config
+          path: k8s-config
+          token: ${{ secrets.TARGET_REPO_TOKEN }}
 
       - name: Update values.yaml
         env:
+          IMAGE_PULL_REPOSITORY: ${{ secrets.HARBOR_URL }}/${{ secrets.HARBOR_PROJECT }}/open-webui-backend
           IMAGE_TAG: ${{ env.IMAGE_TAG }}
-          SERVICE_NAME: openwebui # values.yaml의 키와 일치
+          SERVICE_NAME: openwebui
         run: |
           cd k8s-config
-          yq eval '.openwebui.tag = env(IMAGE_TAG)' -i values.yaml
+          yq eval '.${{ env.SERVICE_NAME }}.repository = env(IMAGE_PULL_REPOSITORY)' -i values.yaml
+          yq eval '.${{ env.SERVICE_NAME }}.tag = env(IMAGE_TAG)' -i values.yaml
+          yq eval '.${{ env.SERVICE_NAME }}.imagePullSecrets = [{"name":"harbor-cred"}]' -i values.yaml
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add values.yaml
-          git commit -m "Update ${{ env.SERVICE_NAME }} image tag to ${{ env.IMAGE_TAG }}"
-          git push origin main # k8s-config 리포지토리의 기본 브랜치
-
-      # # 타겟 리포지토리 클론
-      # - name: Checkout Target Repository
-      #   uses: actions/checkout@v4
-      #   with:
-      #     repository: mtvs-3rd-outsider/k8s-config # 타겟 리포지토리 소유자/이름으로 변경
-      #     path: k8s-config
-      #     token: ${{ secrets.TARGET_REPO_TOKEN }} # 타겟 리포지토리에 접근할 수 있는 토큰
-
-    # values.yaml 업데이트
+          git commit -m "Update ${{ env.SERVICE_NAME }} image to ${{ env.IMAGE_PULL_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+          git push origin main
