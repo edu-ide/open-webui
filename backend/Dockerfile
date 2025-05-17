@@ -19,6 +19,16 @@ RUN pip install --no-cache-dir --upgrade pip && \
 #    open_webui 디렉토리와 src 디렉토리 등을 복사합니다.
 COPY ./open_webui ./open_webui
 COPY ./src ./src
+
+# CHANGELOG.md 파일 복사 추가
+# 가정: CHANGELOG.md는 Dockerfile의 context (./backend)의 부모 디렉토리, 즉 open-webui 프로젝트 루트에 위치
+#      애플리케이션은 /app/open_webui/CHANGELOG.md 또는 /app/CHANGELOG.md 에서 파일을 찾음
+#      우선 /app/CHANGELOG.md 로 복사 시도 (루트에서 찾는 경우 대비)
+COPY ../CHANGELOG.md /app/CHANGELOG.md 
+# 만약 /app/open_webui/CHANGELOG.md 라면 다음 줄 사용 또는 둘 다 복사 고려
+# COPY ../CHANGELOG.md /app/open_webui/CHANGELOG.md 
+
+
 # COPY . . # 만약 backend 폴더 전체를 복사하고 싶다면, 단 .dockerignore에 명시된 파일/폴더는 제외됩니다.
 
 # 7. FastAPI 애플리케이션이 실행될 포트를 지정합니다. (예: 8080)
