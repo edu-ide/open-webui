@@ -7,6 +7,9 @@ on:
 jobs:
   build-and-push-image:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,6 +38,8 @@ jobs:
           tags: |
             ${{ secrets.HARBOR_URL }}/${{ secrets.HARBOR_PROJECT }}/open-webui-backend:${{ env.IMAGE_TAG }}
             ${{ secrets.HARBOR_URL }}/${{ secrets.HARBOR_PROJECT }}/open-webui-backend:latest
+          cache-from: type=registry,ref=${{ secrets.HARBOR_URL }}/${{ secrets.HARBOR_PROJECT }}/open-webui-backend:buildcache
+          cache-to: type=registry,ref=${{ secrets.HARBOR_URL }}/${{ secrets.HARBOR_PROJECT }}/open-webui-backend:buildcache,mode=max
 
       - name: Install yq
         run: |
@@ -63,3 +68,14 @@ jobs:
           git add values.yaml
           git commit -m "Update ${{ env.SERVICE_NAME }} image to ${{ env.IMAGE_PULL_REPOSITORY }}:${{ env.IMAGE_TAG }}"
           git push origin main
+
+      - name: action-slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          author_name: www-be
+          fields: repo,message,commit,author,action,eventName,ref,workflow,job,took
+          if_mention: failure,cancelled
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

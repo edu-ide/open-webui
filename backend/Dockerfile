@@ -20,14 +20,10 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY ./open_webui ./open_webui
 COPY ./src ./src
 
-# CHANGELOG.md 파일 복사 추가
-# 가정: CHANGELOG.md는 Dockerfile의 context (./backend)의 부모 디렉토리, 즉 open-webui 프로젝트 루트에 위치
-#      애플리케이션은 /app/open_webui/CHANGELOG.md 또는 /app/CHANGELOG.md 에서 파일을 찾음
-#      우선 /app/CHANGELOG.md 로 복사 시도 (루트에서 찾는 경우 대비)
-COPY ../CHANGELOG.md /app/CHANGELOG.md 
-# 만약 /app/open_webui/CHANGELOG.md 라면 다음 줄 사용 또는 둘 다 복사 고려
-# COPY ../CHANGELOG.md /app/open_webui/CHANGELOG.md 
-
+# CHANGELOG.md 파일 복사
+# 가정: CHANGELOG.md는 이 Dockerfile의 빌드 컨텍스트(예: 'open-webui/backend/')의 부모 디렉토리, 즉 'open-webui/' 프로젝트 루트에 위치합니다.
+# Python 코드가 /CHANGELOG.md 에서 파일을 찾을 수 있도록 해당 위치로 복사합니다.
+COPY ../CHANGELOG.md /CHANGELOG.md
 
 # COPY . . # 만약 backend 폴더 전체를 복사하고 싶다면, 단 .dockerignore에 명시된 파일/폴더는 제외됩니다.
 
