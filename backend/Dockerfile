@@ -9,7 +9,7 @@ WORKDIR /app
 
 # 4. requirements.txt 파일을 작업 디렉토리로 복사합니다.
 #    Dockerfile과 같은 위치에 requirements.txt가 있다고 가정합니다.
-COPY requirements.txt .
+COPY ./backend/requirements.txt .
 
 # 5. 복사된 requirements.txt를 사용하여 Python 의존성을 설치합니다.
 RUN pip install --no-cache-dir --upgrade pip && \
