@@ -38,6 +38,8 @@ jobs:
           tags: |
             ${{ secrets.HARBOR_URL }}/${{ secrets.HARBOR_PROJECT }}/open-webui-backend:${{ env.IMAGE_TAG }}
             ${{ secrets.HARBOR_URL }}/${{ secrets.HARBOR_PROJECT }}/open-webui-backend:latest
+          cache-from: type=registry,ref=${{ secrets.HARBOR_URL }}/${{ secrets.HARBOR_PROJECT }}/open-webui-backend:buildcache
+          cache-to: type=registry,ref=${{ secrets.HARBOR_URL }}/${{ secrets.HARBOR_PROJECT }}/open-webui-backend:buildcache,mode=max
 
       - name: Install yq
         run: |

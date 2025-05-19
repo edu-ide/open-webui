@@ -17,13 +17,13 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # 6. 백엔드 애플리케이션 코드 전체를 작업 디렉토리로 복사합니다.
 #    open_webui 디렉토리와 src 디렉토리 등을 복사합니다.
-COPY ./open_webui ./open_webui
-COPY ./src ./src
+COPY ./backend/open_webui ./open_webui
+COPY ./backend/src ./src
 
 # CHANGELOG.md 파일 복사
 # 가정: CHANGELOG.md는 이 Dockerfile의 빌드 컨텍스트(예: 'open-webui/backend/')의 부모 디렉토리, 즉 'open-webui/' 프로젝트 루트에 위치합니다.
 # Python 코드가 /CHANGELOG.md 에서 파일을 찾을 수 있도록 해당 위치로 복사합니다.
-COPY ../CHANGELOG.md /CHANGELOG.md
+COPY ./CHANGELOG.md /CHANGELOG.md
 
 # COPY . . # 만약 backend 폴더 전체를 복사하고 싶다면, 단 .dockerignore에 명시된 파일/폴더는 제외됩니다.
 
