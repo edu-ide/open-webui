@@ -4,17 +4,10 @@ import { PUBLIC_WEBUI_HOSTNAME } from '$env/static/public';
 
 export const APP_NAME = 'Open WebUI';
 
-export const WEBUI_HOSTNAME = browser ? PUBLIC_WEBUI_HOSTNAME : '';
-export const WEBUI_BASE_URL = browser
-	? dev
-		? `http://${WEBUI_HOSTNAME}/webui`
-		: `/webui`
-	: `/webui`;
-export const WEBUI_BASE_URL_NO_PREFIX = browser
-? dev
-	? `http://${WEBUI_HOSTNAME}`
-	: `/`
-: `/webui`;
+export const WEBUI_BASE_URL_NO_PREFIX = PUBLIC_WEBUI_HOSTNAME ;
+export const WEBUI_BASE_URL = `${WEBUI_BASE_URL_NO_PREFIX}/webui`
+	
+
 export const WEBUI_API_BASE_URL = `${WEBUI_BASE_URL}/api/v1`;
 
 export const OLLAMA_API_BASE_URL = `${WEBUI_BASE_URL}/ollama`;

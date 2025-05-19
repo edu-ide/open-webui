@@ -850,8 +850,8 @@ if OPENAI_API_KEYS_LIST_FROM_ENV:
     OPENAI_API_KEYS_LIST = OPENAI_API_KEYS_LIST_FROM_ENV
 else:
     OPENAI_API_KEYS_LIST = [
-        os.environ.get("OPENAI_API_KEY", "sk-proj-1234567890"),  # 기본 OpenAI API 키
-        os.environ.get("XAI_API_KEY", "")
+        os.environ.get("XAI_API_KEY", ""),
+        os.environ.get("OPENAI_API_KEY", "sk-proj-1234567890")  # 기본 OpenAI API 키
     ]
 # 빈 문자열 키 제거
 OPENAI_API_KEYS_LIST = [key for key in OPENAI_API_KEYS_LIST if key]
