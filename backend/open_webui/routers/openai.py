@@ -58,6 +58,7 @@ log.setLevel(SRC_LOG_LEVELS["OPENAI"])
 
 async def send_get_request(url, key=None, user: UserModel = None):
     timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST)
+    print(f"Sending GET request to {url} with key {key}")
     try:
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.get(
@@ -639,7 +640,14 @@ async def generate_chat_completion(
 
     await get_all_models(request, user=user)
     model = request.app.state.OPENAI_MODELS.get(model_id)
-    if model:
+
+    # grok-3-beta면 XAI URL/KEY 인덱스를 강제로 사용
+    if model_id == "grok-3":
+        try:
+            idx = request.app.state.config.OPENAI_API_BASE_URLS.index("https://api.x.ai/v1")
+        except ValueError:
+            raise HTTPException(status_code=500, detail="XAI URL not found in config")
+    elif model:
         idx = model["urlIdx"]
     else:
         raise HTTPException(

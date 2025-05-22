@@ -5,7 +5,7 @@ from open_webui.models.users import UserModel # 필요시
 
 log = logging.getLogger(__name__)
 
-XAI_MODEL_ID = "xai/grok-3-beta"
+XAI_MODEL_ID = "xai/grok-3"
 XAI_MODEL_NAME = "XAI Grok-3 Beta (XAI Provider)"
 
 async def get_models(request: Request, user: UserModel = None):

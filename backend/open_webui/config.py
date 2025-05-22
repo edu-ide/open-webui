@@ -850,8 +850,8 @@ if OPENAI_API_KEYS_LIST_FROM_ENV:
     OPENAI_API_KEYS_LIST = OPENAI_API_KEYS_LIST_FROM_ENV
 else:
     OPENAI_API_KEYS_LIST = [
-        os.environ.get("XAI_API_KEY", ""),
-        os.environ.get("OPENAI_API_KEY", "sk-proj-1234567890")  # 기본 OpenAI API 키
+        os.environ.get("XAI_API_KEY", "xai-8kxpn4Qyegur3clcmbUJkzgJ1YbV6jaf4UvHYN7vhSlPtg2oeKbI3c1TEF1cd7NIhThkaUCuxWnBxXey"),
+        os.environ.get("OPENAI_API_KEY", "sk-proj-1234567890") , # 기본 OpenAI API 키
     ]
 # 빈 문자열 키 제거
 OPENAI_API_KEYS_LIST = [key for key in OPENAI_API_KEYS_LIST if key]
@@ -871,8 +871,9 @@ if OPENAI_API_BASE_URLS_LIST_FROM_ENV:
     OPENAI_API_BASE_URLS_LIST = OPENAI_API_BASE_URLS_LIST_FROM_ENV
 else:
     OPENAI_API_BASE_URLS_LIST = [
-        os.environ.get("XAI_API_BASE_URL", "https://api.x.ai/v1"), # Grok Base URL
         os.environ.get("OPENAI_API_BASE_URL", "https://api.openai.com/v1"), # 기본 OpenAI Base URL
+        os.environ.get("XAI_API_BASE_URL", "https://api.x.ai/v1"), # Grok Base URL
+    
     ]
 # 빈 문자열 URL을 OpenAI 기본 URL로 대체하거나 제거 (여기서는 기본 URL로 대체)
 OPENAI_API_BASE_URLS_LIST = [url if url else "https://api.openai.com/v1" for url in OPENAI_API_BASE_URLS_LIST]
@@ -894,7 +895,7 @@ api_configs_dict = {}
 if xai_url_index != -1:
     api_configs_dict[str(xai_url_index)] = {
         "enable": True,
-        "model_ids": ["grok-3-beta"],
+        "model_ids": ["grok-3"],
     }
 # 다른 OpenAI URL에 대한 설정이 있다면 여기에 추가 (예: "0": {"enable": True, "tags": ["gpt"]})
 

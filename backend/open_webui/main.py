@@ -8,6 +8,7 @@ import shutil
 import sys
 import time
 import random
+import uuid
 
 from contextlib import asynccontextmanager
 from urllib.parse import urlencode, parse_qs, urlparse
@@ -452,29 +453,65 @@ https://github.com/open-webui/open-webui
 
 
 def add_initial_grok_model_on_startup():
-    model_id = "grok-3-beta"
-    model_name = "grok-3-beta" 
+    model_id = "grok-3"
+    model_name = "grok-3"
 
     admin_user_id: Optional[str] = None
-    admin_email_val = ADMIN_EMAIL.value 
+    admin_email_val = ADMIN_EMAIL.value
     if admin_email_val:
         admin_user = Users.get_user_by_email(admin_email_val)
         if admin_user:
             admin_user_id = admin_user.id
+            log.info(f"Admin user '{admin_user.email}' (ID: {admin_user_id}) found via ADMIN_EMAIL for initial Grok model setup.")
         else:
-            log.warning(f"Admin user with email '{admin_email_val}' not found for initial Grok model setup.")
-    
+            log.warning(f"Admin user with email '{admin_email_val}' (from ADMIN_EMAIL) not found.")
+
     if not admin_user_id:
-        users_data = Users.get_users() # 이제 {'users': [UserModel, ...]} 형태를 기대합니다.
+        users_data = Users.get_users()
         if isinstance(users_data, dict) and 'users' in users_data and isinstance(users_data['users'], list):
             actual_users_list = users_data['users']
             admin_users_list = [user for user in actual_users_list if hasattr(user, 'role') and user.role == "admin"]
             if admin_users_list:
                 admin_user_id = admin_users_list[0].id
-                log.info(f"Found admin user '{admin_users_list[0].email}' (ID: {admin_user_id}) for initial Grok model setup.")
+                log.info(f"Found existing admin user '{admin_users_list[0].email}' (ID: {admin_user_id}) for initial Grok model setup.")
             else:
-                log.warning("No admin user found (after checking all users). Initial Grok model will not be added as it requires an owner. Skipping model addition.")
-                return
+                log.info("No existing admin user found. Attempting to create a default admin user.")
+                default_admin_email = "admin@localhost.com"
+                default_admin_name = "Admin User"
+                # Users.insert_new_user는 password_hash를 직접 받지 않습니다.
+                # Open WebUI는 일반적으로 초기 비밀번호 설정을 UI나 다른 메커니즘에 의존합니다.
+                # 여기서는 비밀번호 없이 관리자 계정을 생성하고, 로그에 안내를 남깁니다.
+                new_admin_id = str(uuid.uuid4())
+                
+                # Check if default admin email already exists (e.g. from a previous partial setup)
+                existing_default_admin = Users.get_user_by_email(default_admin_email)
+                if existing_default_admin:
+                    log.warning(f"A user with the default admin email '{default_admin_email}' already exists (ID: {existing_default_admin.id}). Using this user.")
+                    if existing_default_admin.role != "admin":
+                        log.info(f"Updating role of user '{existing_default_admin.email}' to 'admin'.")
+                        Users.update_user_role_by_id(id=existing_default_admin.id, role="admin")
+                    admin_user_id = existing_default_admin.id
+                else:
+                    try:
+                        created_user = Users.insert_new_user(
+                            id=new_admin_id,
+                            name=default_admin_name,
+                            email=default_admin_email,
+                            role="admin", # 생성 시 바로 admin 역할 부여
+                            profile_image_url="/static/favicon.png" # 기본 이미지 사용
+                        )
+                        if created_user:
+                            admin_user_id = created_user.id
+                            log.info(f"Successfully created a default admin user with ID: {admin_user_id}, Email: {default_admin_email}, Name: {default_admin_name}.")
+                            log.warning(f"IMPORTANT: Default admin '{default_admin_email}' was created. Please log in and update the profile/password immediately via the UI.")
+                        else:
+                            log.error("Failed to create a default admin user.")
+                    except Exception as e:
+                        log.error(f"Error creating default admin user: {e}", exc_info=True)
+
+    if not admin_user_id:
+        log.error("Could not find or create an admin user. Initial Grok model will not be added as it requires an owner. Skipping model addition.")
+        return
 
     if Models.get_model_by_id(model_id):
         log.info(f"Initial model '{model_id}' already exists in the database.")
@@ -1441,18 +1478,30 @@ async def list_tasks_by_chat_id_endpoint(chat_id: str, user=Depends(get_verified
 @app.get("/api/config")
 async def get_app_config(request: Request):
     user = None
-    if "token" in request.cookies:
+    token = None
+
+    # 1. Authorization 헤더에서 토큰 확인
+    auth_header = request.headers.get("Authorization")
+    if auth_header:
+        cred = get_http_authorization_cred(auth_header)
+        if cred and cred.scheme.lower() == "bearer":
+            token = cred.credentials
+    
+    # 2. 헤더에 토큰이 없으면 쿠키에서 토큰 확인
+    if not token and "token" in request.cookies:
         token = request.cookies.get("token")
+
+    if token:
         try:
-            data = decode_token(token)
+            # API 키인 경우 (sk-...) 사용자를 가져오지 않음 (get_current_user 로직과 유사하게 처리)
+            # /api/config는 일반적으로 브라우저 세션에서 호출되므로 API 키보다는 JWT 토큰을 기대함
+            if not token.startswith("sk-"):
+                data = decode_token(token)
+                if data is not None and "id" in data:
+                    user = Users.get_user_by_id(data["id"])
         except Exception as e:
-            log.debug(e)
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token",
-            )
-        if data is not None and "id" in data:
-            user = Users.get_user_by_id(data["id"])
+            log.debug(f"Error decoding token in /api/config: {e}")
+            # 토큰 디코딩 실패 시 특별한 오류 처리는 하지 않고 user를 None으로 유지
 
     user_count = Users.get_num_users()
     onboarding = False
