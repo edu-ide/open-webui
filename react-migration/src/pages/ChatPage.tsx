@@ -54,9 +54,9 @@ export default function ChatPage() {
   const isEmptyChat = !currentChat || currentChat.messages.length === 0;
 
   return (
-    <div className="flex h-screen w-full flex-col">
+    <div className="flex h-screen w-full flex-col overflow-hidden">
       {/* Chat Content */}
-      <div className="flex h-full w-full flex-col">
+      <div className="flex h-full w-full flex-col overflow-hidden">
         {isEmptyChat ? (
           /* Empty State - Original Open WebUI Style */
           <div className="flex h-full flex-col justify-center">
@@ -143,7 +143,7 @@ export default function ChatPage() {
         )}
 
         {/* Chat Input - Fixed at bottom */}
-        <div className="flex-shrink-0 border-t border-gray-100 bg-white dark:border-gray-800 dark:bg-gray-900">
+        <div className="flex-shrink-0 border-t border-gray-100 bg-white dark:border-gray-800 dark:bg-gray-900 pb-safe">
           <ChatInput
             onSendMessage={handleSendMessage}
             isLoading={isGenerating}

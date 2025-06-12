@@ -3,7 +3,7 @@ import { Card, Empty, Spin, Button, Form, Input, message } from 'antd';
 import { PlayCircleOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useMcpTools, useMcpExecute, useMcpServer } from '../../hooks/useMcp';
 import { McpTool } from '../../types/mcp';
-import ReactJson from 'react-json-view';
+// Remove react-json-view import - we'll use a simple JSON display
 
 interface ToolsExplorerProps {
   serverId?: string;
@@ -136,12 +136,15 @@ export const ToolsExplorer: React.FC<ToolsExplorerProps> = ({
               maxHeight: 300,
               overflow: 'auto'
             }}>
-              <ReactJson 
-                src={lastResult} 
-                collapsed={1}
-                displayDataTypes={false}
-                name={false}
-              />
+              <pre style={{ 
+                margin: 0, 
+                fontFamily: 'monospace',
+                fontSize: '12px',
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word'
+              }}>
+                {JSON.stringify(lastResult, null, 2)}
+              </pre>
             </div>
           </div>
         )}

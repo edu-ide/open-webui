@@ -19,6 +19,28 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+  overflow: hidden;
+}
+
+/* Safe area support for mobile devices */
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom, 0);
+}
+
+/* Prevent iOS bounce scrolling */
+html, body {
+  position: fixed;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Fix for mobile viewport height */
+.h-screen {
+  height: 100vh;
+  height: -webkit-fill-available;
+  height: fill-available;
 }
 
 @media (prefers-color-scheme: light) {
