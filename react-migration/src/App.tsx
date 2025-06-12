@@ -8,6 +8,7 @@ import { PageLoading } from './components/common/LoadingSpinner';
 import Sidebar from './components/layout/Sidebar';
 import ChatPage from './pages/ChatPage';
 import AuthPage from './pages/AuthPage';
+import { McpDashboard } from './components/mcp';
 import { useResponsive } from './hooks/useResponsive';
 import { Bars3Icon } from '@heroicons/react/24/outline';
 
@@ -63,6 +64,7 @@ function AppLayout() {
             <Route path="/auth" element={<AuthPage />} />
             <Route path="/" element={<ChatPage />} />
             <Route path="/c/:id" element={<ChatPage />} />
+            <Route path="/mcp" element={<McpDashboard />} />
           </Routes>
         </div>
       </div>

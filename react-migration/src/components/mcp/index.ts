@@ -1,5 +1,4 @@
-/**
- * MCP 관련 컴포넌트
- */
-
-export { MCPMonitorComponent } from './MCPMonitorComponent';
+export { McpDashboard } from './McpDashboard';
+export { ServerList } from './ServerList';
+export { ToolsExplorer } from './ToolsExplorer';
+export { ExecutionLog } from './ExecutionLog';

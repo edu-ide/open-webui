@@ -1,0 +1,72 @@
+# Open-WebUI Migration from Svelte to React with SWC
+
+## Project Overview
+Migrate the Open-WebUI application from Svelte/SvelteKit framework to React with SWC compiler, maintaining all existing functionality while improving integration capabilities with the existing React-based microblog-lms system.
+
+## Business Requirements
+1. Complete migration from Svelte to React framework
+2. Use SWC as the compiler for optimal performance
+3. Maintain all existing features and functionality
+4. Preserve the current UI/UX design
+5. Ensure compatibility with existing backend APIs
+6. Enable better integration with microblog-lms (React-based)
+7. Maintain or improve current performance metrics
+
+## Technical Requirements
+1. Convert all Svelte components to React functional components
+2. Migrate from SvelteKit routing to React Router
+3. Replace Svelte stores with React state management (Context API/Zustand)
+4. Convert Svelte reactive statements to React hooks
+5. Migrate build configuration from SvelteKit to Vite + React + SWC
+6. Preserve all existing API integrations
+7. Maintain WebSocket connections for real-time features
+8. Convert Svelte animations to React equivalents
+9. Migrate all styles (CSS/SCSS) appropriately
+10. Ensure proper TypeScript typing throughout
+
+## Key Features to Migrate
+1. Chat interface and conversation management
+2. User authentication and session management
+3. Model selection and configuration
+4. File upload and processing capabilities
+5. Markdown rendering with code highlighting
+6. Voice input/output features
+7. Settings and preferences management
+8. Multi-language support (i18n)
+9. Theme switching (dark/light mode)
+10. WebSocket-based real-time updates
+
+## Migration Strategy
+1. Set up new React project structure with Vite and SWC
+2. Create React equivalents of core components
+3. Implement routing with React Router
+4. Set up state management solution
+5. Migrate API service layers
+6. Convert UI components systematically
+7. Implement authentication flow
+8. Migrate utility functions and helpers
+9. Set up testing framework
+10. Perform comprehensive testing
+
+## Success Criteria
+1. All features working identically to Svelte version
+2. No regression in performance
+3. Successful integration with microblog-lms
+4. All tests passing
+5. Clean build with no errors
+6. Proper error handling maintained
+7. Accessibility features preserved
+
+## Constraints
+1. Must maintain compatibility with existing backend
+2. No changes to API contracts
+3. Preserve current URL structure
+4. Maintain current browser support
+5. Keep bundle size reasonable
+
+## Deliverables
+1. Fully functional React application
+2. Updated build and deployment scripts
+3. Migration documentation
+4. Updated README and setup guides
+5. Test suite with good coverage
