@@ -1,0 +1,14 @@
+fail_on_severity: 'moderate'
+allow_dependencies_licenses: 
+  - 'MIT'
+  - 'Apache-2.0'
+  - 'BSD-2-Clause'
+  - 'BSD-3-Clause'
+  - 'ISC'
+  - 'WTFPL'
+  - '0BSD'
+deny_packages:
+  - 'lodash'
+  - 'moment'
+allow_ghsas:
+  - 'GHSA-example-1234'
