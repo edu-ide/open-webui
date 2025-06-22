@@ -24,86 +24,86 @@ spec:
         prometheus.io/path: "/health"
     spec:
       containers:
-      - name: react-migration
-        image: react-migration:latest
-        imagePullPolicy: IfNotPresent
-        ports:
-        - containerPort: 3000
-          name: http
-          protocol: TCP
-        env:
-        - name: NODE_ENV
-          value: "production"
-        - name: VITE_API_BASE_URL
-          value: "http://gateway.ugot.svc.cluster.local:8080"
-        - name: VITE_WS_URL
-          value: "ws://gateway.ugot.svc.cluster.local:8080/ws"
-        - name: VITE_ENABLE_ANALYTICS
-          value: "true"
-        - name: VITE_APP_NAME
-          value: "OpenWebUI React Migration"
-        resources:
-          requests:
-            memory: "128Mi"
-            cpu: "100m"
-          limits:
-            memory: "256Mi"
-            cpu: "200m"
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 3000
-          initialDelaySeconds: 30
-          periodSeconds: 10
-          timeoutSeconds: 5
-          failureThreshold: 3
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: 3000
-          initialDelaySeconds: 5
-          periodSeconds: 5
-          timeoutSeconds: 3
-          failureThreshold: 3
-        securityContext:
-          allowPrivilegeEscalation: false
-          runAsNonRoot: true
-          runAsUser: 101  # nginx user
-          readOnlyRootFilesystem: true
-          capabilities:
-            drop:
-            - ALL
-            add:
-            - NET_BIND_SERVICE
-        volumeMounts:
-        - name: nginx-cache
-          mountPath: /var/cache/nginx
-        - name: nginx-tmp
-          mountPath: /tmp
+        - name: react-migration
+          image: react-migration:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+              name: http
+              protocol: TCP
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: VITE_API_BASE_URL
+              value: "http://gateway.ugot.svc.cluster.local"
+            - name: VITE_WS_URL
+              value: "ws://gateway.ugot.svc.cluster.local/ws"
+            - name: VITE_ENABLE_ANALYTICS
+              value: "true"
+            - name: VITE_APP_NAME
+              value: "OpenWebUI React Migration"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 101 # nginx user
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_BIND_SERVICE
+          volumeMounts:
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-tmp
+              mountPath: /tmp
       volumes:
-      - name: nginx-cache
-        emptyDir: {}
-      - name: nginx-tmp
-        emptyDir: {}
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-tmp
+          emptyDir: {}
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
-          - weight: 100
-            podAffinityTerm:
-              labelSelector:
-                matchExpressions:
-                - key: app
-                  operator: In
-                  values:
-                  - react-migration
-              topologyKey: kubernetes.io/hostname
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - react-migration
+                topologyKey: kubernetes.io/hostname
       topologySpreadConstraints:
-      - maxSkew: 1
-        topologyKey: kubernetes.io/hostname
-        whenUnsatisfiable: DoNotSchedule
-        labelSelector:
-          matchLabels:
-            app: react-migration
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: react-migration
 ---
 apiVersion: v1
 kind: Service
@@ -116,10 +116,10 @@ metadata:
 spec:
   type: ClusterIP
   ports:
-  - port: 80
-    targetPort: 3000
-    protocol: TCP
-    name: http
+    - port: 80
+      targetPort: 3000
+      protocol: TCP
+      name: http
   selector:
     app: react-migration
 ---
@@ -144,22 +144,22 @@ metadata:
       proxy_set_header Connection "upgrade";
 spec:
   rules:
-  - host: react-migration.local
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: react-migration
-            port:
-              number: 80
-  - http:
-      paths:
-      - path: /react-migration
-        pathType: Prefix
-        backend:
-          service:
-            name: react-migration
-            port:
-              number: 80
+    - host: react-migration.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: react-migration
+                port:
+                  number: 80
+    - http:
+        paths:
+          - path: /react-migration
+            pathType: Prefix
+            backend:
+              service:
+                name: react-migration
+                port:
+                  number: 80

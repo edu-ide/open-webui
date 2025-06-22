@@ -37,6 +37,11 @@
     "format:check": "prettier --check \"src/**/*.{ts,tsx,js,jsx,json,css,md}\""
   },
   "dependencies": {
+    "@copilotkit/react-core": "^1.9.0",
+    "@copilotkit/react-textarea": "^1.9.0",
+    "@copilotkit/react-ui": "^1.9.0",
+    "@copilotkit/runtime": "^1.9.0",
+    "@copilotkit/runtime-client-gql": "^1.9.0",
     "@heroicons/react": "^2.2.0",
     "@heroui/react": "^2.7.9",
     "@heroui/theme": "^2.4.16",

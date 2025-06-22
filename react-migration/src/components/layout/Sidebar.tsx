@@ -180,6 +180,49 @@ export default function Sidebar({ className = '' }: SidebarProps) {
 
           {/* 채팅 목록 */}
           <div className="relative flex flex-col flex-1 overflow-y-auto overflow-x-hidden mt-2">
+            {/* 특별 메뉴 */}
+            <div className="px-2 mb-2">
+              <div className="text-xs text-gray-500 dark:text-gray-400 font-medium mb-2 px-2">
+                Features
+              </div>
+              <div className="flex flex-col space-y-1">
+                <NavLink
+                  to="/mcp"
+                  onClick={handleChatClick}
+                  className={({ isActive }) =>
+                    `group w-full flex justify-between rounded-lg px-[11px] py-[6px] transition-all duration-200 whitespace-nowrap text-ellipsis ${
+                      isActive
+                        ? 'bg-gray-200 dark:bg-gray-900'
+                        : 'hover:bg-gray-100 dark:hover:bg-gray-950'
+                    }`
+                  }
+                >
+                  <div className="flex self-center flex-1 w-full">
+                    <div className="text-left self-center overflow-hidden w-full h-[20px] truncate">
+                      MCP Dashboard
+                    </div>
+                  </div>
+                </NavLink>
+                <NavLink
+                  to="/copilot-mcp"
+                  onClick={handleChatClick}
+                  className={({ isActive }) =>
+                    `group w-full flex justify-between rounded-lg px-[11px] py-[6px] transition-all duration-200 whitespace-nowrap text-ellipsis ${
+                      isActive
+                        ? 'bg-gray-200 dark:bg-gray-900'
+                        : 'hover:bg-gray-100 dark:hover:bg-gray-950'
+                    }`
+                  }
+                >
+                  <div className="flex self-center flex-1 w-full">
+                    <div className="text-left self-center overflow-hidden w-full h-[20px] truncate">
+                      CopilotKit + MCP Demo
+                    </div>
+                  </div>
+                </NavLink>
+              </div>
+            </div>
+            
             <div className="px-2 mt-0.5">
               <div className="text-xs text-gray-500 dark:text-gray-400 font-medium mb-2 px-2">
                 Chats

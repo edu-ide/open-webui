@@ -20,6 +20,92 @@ const getMcpManager = () => {
   return mcpManager;
 };
 
+// Main MCP hook that combines all functionality
+export const useMcp = () => {
+  const queryClient = useQueryClient();
+  const manager = getMcpManager();
+  const [servers, setServers] = useState<McpServerState[]>([]);
+  const [activeServer, setActiveServer] = useState<McpServerState | null>(null);
+  const [tools, setTools] = useState<McpTool[]>([]);
+  const [isConnected, setIsConnected] = useState(false);
+
+  useEffect(() => {
+    // Initial load
+    const allServers = manager.getAllServers();
+    setServers(allServers);
+    
+    // Find first connected server
+    const connectedServer = allServers.find(s => s.status === 'connected');
+    if (connectedServer) {
+      setActiveServer(connectedServer);
+      setIsConnected(true);
+      // Load tools for connected server
+      manager.listTools(connectedServer.config.id).then(setTools).catch(console.error);
+    }
+
+    // Listen for server changes
+    const handleServerStateChange = (state: McpServerState) => {
+      const updatedServers = manager.getAllServers();
+      setServers(updatedServers);
+      
+      if (state.status === 'connected' && (!activeServer || activeServer.config.id === state.config.id)) {
+        setActiveServer(state);
+        setIsConnected(true);
+        // Load tools when server connects
+        manager.listTools(state.config.id).then(setTools).catch(console.error);
+      } else if (state.status === 'disconnected' && activeServer?.config.id === state.config.id) {
+        setIsConnected(false);
+        setTools([]);
+      }
+    };
+
+    manager.on('serverStateChange', handleServerStateChange);
+
+    return () => {
+      manager.off('serverStateChange', handleServerStateChange);
+    };
+  }, [activeServer]);
+
+  const connectToServer = useCallback(async (serverId: string) => {
+    try {
+      await manager.connectServer(serverId);
+      const server = manager.getServerState(serverId);
+      setActiveServer(server);
+      setIsConnected(server.status === 'connected');
+      if (server.status === 'connected') {
+        const serverTools = await manager.listTools(serverId);
+        setTools(serverTools);
+      }
+    } catch (error) {
+      console.error('Failed to connect to server:', error);
+      throw error;
+    }
+  }, []);
+
+  const executeToolCall = useCallback(async (toolName: string, args: Record<string, any>) => {
+    if (!activeServer || activeServer.status !== 'connected') {
+      throw new Error('No active server connection');
+    }
+    
+    try {
+      const result = await manager.executeTool(activeServer.config.id, toolName, args);
+      return result;
+    } catch (error) {
+      console.error('Failed to execute tool:', error);
+      throw error;
+    }
+  }, [activeServer]);
+
+  return {
+    servers,
+    activeServer,
+    tools,
+    isConnected,
+    connectToServer,
+    executeToolCall,
+  };
+};
+
 // Hook for managing MCP servers
 export const useMcpServers = () => {
   const queryClient = useQueryClient();

@@ -96,23 +96,37 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       isAuthenticated: apiService.isAuthenticated,
       isLoading: apiService.isAuthChecking,
     }));
-  }, [apiService]);
+  }, [apiService.user, apiService.isAuthenticated, apiService.isAuthChecking]);
 
   // API 서비스 초기화 및 상태 동기화
   useEffect(() => {
     console.log('[AuthProvider] Initializing with API Service');
     
     // 초기 상태 동기화
-    syncWithApiService();
+    setAuthState(prev => ({
+      ...prev,
+      user: apiService.user,
+      token: apiService.isAuthenticated ? 'valid' : null,
+      isAuthenticated: apiService.isAuthenticated,
+      isLoading: apiService.isAuthChecking,
+    }));
 
     // 인증 리다이렉트 콜백 설정
     apiService.registerAuthRedirect(() => {
       console.log('[AuthProvider] Auth redirect triggered');
-      clearAuth();
+      apiService.onLogout();
+      setAuthState(prev => ({
+        ...prev,
+        user: null,
+        token: null,
+        isAuthenticated: false,
+        isLoading: false,
+        error: null,
+      }));
     });
 
     // PostMessage 인증 리스너 설정
-    const handleAuthMessage = (data: { userId: string; sessionToken: string; user: any }) => {
+    const handleAuthMessage = async (data: { userId: string; sessionToken: string; user: any }) => {
       console.log('[AuthProvider] Received auth from host:', { userId: data.userId });
       
       // microblog-lms에서 전달받은 인증 정보를 open-webui 형식으로 변환
@@ -134,7 +148,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       };
 
       // TokenManager를 통해 인증 정보 설정
-      setTokenAndUser(data.sessionToken, convertedUser);
+      await apiService.onLoginSuccess(data.sessionToken);
+      setAuthState(prev => ({
+        ...prev,
+        user: convertedUser,
+        token: data.sessionToken,
+        isAuthenticated: true,
+        isLoading: false,
+        error: null,
+      }));
       
       // 호스트에게 준비 완료 알림
       globalBridge.send('openwebui:ready', {
@@ -169,7 +191,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       globalBridge.off('host:theme', handleThemeMessage);
       globalBridge.off('host:config', handleConfigMessage);
     };
-  }, [syncWithApiService, setTokenAndUser, clearAuth, apiService]);
+  }, []); // 초기화는 한 번만 실행
 
   // API 서비스 상태 변경 감지 및 동기화
   useEffect(() => {

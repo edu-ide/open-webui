@@ -9,6 +9,7 @@ import Sidebar from './components/layout/Sidebar';
 import ChatPage from './pages/ChatPage';
 import AuthPage from './pages/AuthPage';
 import { McpDashboard } from './components/mcp';
+import { CopilotMCPDemo } from './components/copilot/CopilotMCPDemo';
 import { useResponsive } from './hooks/useResponsive';
 import { Bars3Icon } from '@heroicons/react/24/outline';
 
@@ -65,6 +66,7 @@ function AppLayout() {
             <Route path="/" element={<ChatPage />} />
             <Route path="/c/:id" element={<ChatPage />} />
             <Route path="/mcp" element={<McpDashboard />} />
+            <Route path="/copilot-mcp" element={<CopilotMCPDemo />} />
           </Routes>
         </div>
       </div>

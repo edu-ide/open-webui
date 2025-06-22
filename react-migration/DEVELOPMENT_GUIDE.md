@@ -391,7 +391,7 @@ tilt trigger react-migration
 ### 환경별 API URL
 
 - **개발**: `http://localhost:8080`
-- **스테이징**: `http://gateway.ugot.svc.cluster.local:8080`
+- **스테이징**: `http://gateway.ugot.svc.cluster.local`
 - **운영**: `https://api.yourdomain.com`
 
 ### API 프록시 설정
