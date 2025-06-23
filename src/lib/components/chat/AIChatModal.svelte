@@ -3,9 +3,10 @@
 	import { writable } from 'svelte/store';
 	import { toast } from 'svelte-sonner';
 	
-	import { AIChatService, type ChatConversation, type ChatMessage } from '$lib/services/aiChatService';
+	import { EnhancedAIChatService, type EnhancedChatConversation, type EnhancedChatMessage } from '$lib/services/enhancedAIChatService';
 	import { healthCheck, getModelsStatus } from '$lib/apis/aiserver';
 	import { user } from '$lib/stores';
+	import { mcpStatus, mcpToolsList, mcpContextsList, mcpError } from '$lib/stores/mcp';
 	
 	import Modal from '../common/Modal.svelte';
 	import Spinner from '../common/Spinner.svelte';
@@ -14,9 +15,9 @@
 	export let onClose = () => {};
 	
 	// Service and state
-	let aiChatService: AIChatService | null = null;
-	let currentConversation: ChatConversation | null = null;
-	let conversations: ChatConversation[] = [];
+	let aiChatService: EnhancedAIChatService | null = null;
+	let currentConversation: EnhancedChatConversation | null = null;
+	let conversations: EnhancedChatConversation[] = [];
 	let isLoading = false;
 	let isConnected = false;
 	let connectionError = '';
@@ -26,9 +27,11 @@
 	let chatContainer: HTMLElement;
 	let selectedProvider: 'openai' | 'ollama' = 'openai';
 	let isStreaming = false;
+	let enableTools = true;
+	let enableContext = true;
 	
 	// Reactive stores
-	const messages = writable<ChatMessage[]>([]);
+	const messages = writable<EnhancedChatMessage[]>([]);
 	const modelStatus = writable<any>(null);
 	
 	onMount(async () => {
@@ -46,8 +49,15 @@
 			isLoading = true;
 			connectionError = '';
 			
-			// Initialize AI Chat Service
-			aiChatService = new AIChatService($user.token);
+			// Initialize Enhanced AI Chat Service with MCP
+			aiChatService = new EnhancedAIChatService($user.token);
+			
+			// Initialize MCP connection
+			try {
+				await aiChatService.initialize();
+			} catch (mcpError) {
+				console.warn('MCP initialization failed, continuing without MCP:', mcpError);
+			}
 			
 			// Check AI Server health
 			const health = await healthCheck();
@@ -59,9 +69,14 @@
 				modelStatus.set(status);
 				
 				// Load existing conversations
-				conversations = aiChatService.getAllConversations();
+				conversations = aiChatService.getAllConversations() as EnhancedChatConversation[];
 				
-				toast.success('AI Chat connected successfully');
+				const mcpEnabled = aiChatService.isMCPEnabled();
+				if (mcpEnabled) {
+					toast.success('AI Chat connected with MCP tools');
+				} else {
+					toast.success('AI Chat connected');
+				}
 			} else {
 				connectionError = 'AI Server is not available';
 			}
@@ -74,7 +89,10 @@
 		}
 	}
 	
-	function cleanup() {
+	async function cleanup() {
+		if (aiChatService) {
+			await aiChatService.cleanup();
+		}
 		aiChatService = null;
 		currentConversation = null;
 		conversations = [];
@@ -83,12 +101,12 @@
 	function createNewConversation() {
 		if (!aiChatService) return;
 		
-		const conversation = aiChatService.createConversation();
-		conversations = aiChatService.getAllConversations();
+		const conversation = aiChatService.createConversation() as EnhancedChatConversation;
+		conversations = aiChatService.getAllConversations() as EnhancedChatConversation[];
 		selectConversation(conversation);
 	}
 	
-	function selectConversation(conversation: ChatConversation) {
+	function selectConversation(conversation: EnhancedChatConversation) {
 		currentConversation = conversation;
 		messages.set(conversation.messages);
 		
@@ -108,12 +126,12 @@
 		
 		try {
 			if (isStreaming) {
-				// Use streaming for real-time response
-				await aiChatService.sendStreamingMessage(
+				// Use enhanced streaming with MCP
+				await aiChatService.sendEnhancedStreamingMessage(
 					currentConversation.id,
 					message,
 					selectedProvider,
-					(chunk) => {
+					(chunk, metadata) => {
 						// Update messages reactively
 						messages.set([...currentConversation!.messages]);
 						scrollToBottom();
@@ -121,22 +139,42 @@
 					(assistantMessage) => {
 						messages.set([...currentConversation!.messages]);
 						scrollToBottom();
-						toast.success('Message sent');
+						
+						// Show tool usage if any
+						if (assistantMessage.tools_used && assistantMessage.tools_used.length > 0) {
+							toast.success(`Message sent (used tools: ${assistantMessage.tools_used.join(', ')})`);
+						} else {
+							toast.success('Message sent');
+						}
 					},
 					(error) => {
 						toast.error(`Failed to send message: ${error.message}`);
-					}
+					},
+					enableContext,
+					enableTools
 				);
 			} else {
-				// Use regular API call
-				await aiChatService.sendMessage(currentConversation.id, message, selectedProvider);
+				// Use enhanced message with MCP
+				const response = await aiChatService.sendEnhancedMessage(
+					currentConversation.id, 
+					message, 
+					selectedProvider,
+					enableContext,
+					enableTools
+				);
 				messages.set([...currentConversation.messages]);
 				scrollToBottom();
-				toast.success('Message sent');
+				
+				// Show tool usage if any
+				if (response.tools_used && response.tools_used.length > 0) {
+					toast.success(`Message sent (used tools: ${response.tools_used.join(', ')})`);
+				} else {
+					toast.success('Message sent');
+				}
 			}
 			
 			// Update conversations list
-			conversations = aiChatService.getAllConversations();
+			conversations = aiChatService.getAllConversations() as EnhancedChatConversation[];
 			
 		} catch (error) {
 			console.error('Failed to send message:', error);
@@ -156,7 +194,7 @@
 		if (!aiChatService) return;
 		
 		aiChatService.deleteConversation(conversationId);
-		conversations = aiChatService.getAllConversations();
+		conversations = aiChatService.getAllConversations() as EnhancedChatConversation[];
 		
 		if (currentConversation?.id === conversationId) {
 			currentConversation = null;
@@ -218,6 +256,22 @@
 				<input type="checkbox" bind:checked={isStreaming} class="rounded" />
 				<span>Stream</span>
 			</label>
+			
+			<!-- MCP Tools Toggle -->
+			{#if aiChatService?.isMCPEnabled()}
+				<label class="flex items-center space-x-2 text-sm">
+					<input type="checkbox" bind:checked={enableTools} class="rounded" />
+					<span>Tools</span>
+				</label>
+			{/if}
+			
+			<!-- MCP Status -->
+			{#if $mcpStatus !== 'disconnected'}
+				<div class="flex items-center text-xs">
+					<span class="w-2 h-2 rounded-full mr-1 {$mcpStatus === 'authenticated' ? 'bg-green-500' : $mcpStatus === 'connected' ? 'bg-yellow-500' : 'bg-red-500'}"></span>
+					MCP: {$mcpStatus}
+				</div>
+			{/if}
 		</div>
 	</div>
 
@@ -295,9 +349,14 @@
 							<div class="flex {message.role === 'user' ? 'justify-end' : 'justify-start'}">
 								<div class="max-w-xs lg:max-w-md px-4 py-2 rounded-lg {message.role === 'user' ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white'}">
 									<div class="text-sm whitespace-pre-wrap">{message.content}</div>
-									{#if message.role === 'assistant' && message.model}
+									{#if message.role === 'assistant'}
 										<div class="text-xs opacity-70 mt-1">
-											{message.provider} • {message.model}
+											{#if message.model}
+												{message.provider} • {message.model}
+											{/if}
+											{#if message.tools_used && message.tools_used.length > 0}
+												<span class="ml-2">🔧 {message.tools_used.join(', ')}</span>
+											{/if}
 										</div>
 									{/if}
 								</div>
