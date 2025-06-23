@@ -1,12 +1,16 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import ChatContainer from '../components/chat/ChatContainer';
 import ChatInput from '../components/chat/ChatInput';
 import { useChat } from '../contexts/ChatContext';
+import McpSettingsModal from '../components/mcp/McpSettingsModal';
+import '../styles/chat-layout.css';
 
 export default function ChatPage() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const [showMcpSettings, setShowMcpSettings] = useState(false);
+  
   const {
     getCurrentChat,
     selectChat,
@@ -31,8 +35,15 @@ export default function ChatPage() {
     }
   }, [id, selectChat, createChat, navigate]);
 
-  const handleSendMessage = async (content: string, files?: File[]) => {
-    await sendMessage(content, files);
+  const handleSendMessage = async (content: string, files?: File[], tools?: any[]) => {
+    // Include MCP tools information in the message if tools are selected
+    if (tools && tools.length > 0) {
+      const toolsInfo = tools.map(tool => `@${tool.name}`).join(' ');
+      const messageWithTools = `${toolsInfo} ${content}`;
+      await sendMessage(messageWithTools, files);
+    } else {
+      await sendMessage(content, files);
+    }
   };
 
   const handleStopGeneration = () => {
@@ -54,9 +65,9 @@ export default function ChatPage() {
   const isEmptyChat = !currentChat || currentChat.messages.length === 0;
 
   return (
-    <div className="flex h-screen w-full flex-col overflow-hidden">
-      {/* Chat Content */}
-      <div className="flex h-full w-full flex-col overflow-hidden">
+    <div className="chat-page-container">
+      {/* Chat Content Area */}
+      <div className="chat-content-area">
         {isEmptyChat ? (
           /* Empty State - Original Open WebUI Style */
           <div className="flex h-full flex-col justify-center">
@@ -131,27 +142,36 @@ export default function ChatPage() {
           </div>
         ) : (
           /* Chat Messages */
-          <div className="flex-1 overflow-hidden">
-            <ChatContainer
-              messages={currentChat.messages}
-              isLoading={isGenerating}
-              onRegenerate={handleRegenerate}
-              onCopy={handleCopy}
-              onRate={handleRate}
-            />
-          </div>
+          <ChatContainer
+            messages={currentChat.messages}
+            isLoading={isGenerating}
+            onRegenerate={handleRegenerate}
+            onCopy={handleCopy}
+            onRate={handleRate}
+          />
         )}
+      </div>
 
-        {/* Chat Input - Fixed at bottom */}
-        <div className="flex-shrink-0 border-t border-gray-100 bg-white dark:border-gray-800 dark:bg-gray-900 pb-safe">
+      {/* Chat Input - Fixed at bottom */}
+      <div className="chat-input-container">
+        <div className="px-4 py-3 md:px-8 md:py-4">
           <ChatInput
             onSendMessage={handleSendMessage}
             isLoading={isGenerating}
             onStopGeneration={handleStopGeneration}
-            placeholder="HMR 테스트 중입니다... (Shift+Enter로 줄바꿈)"
+            placeholder="메시지를 입력하세요..."
+            onOpenSettings={() => setShowMcpSettings(true)}
           />
         </div>
       </div>
+      
+      {/* MCP Settings Modal */}
+      {showMcpSettings && (
+        <McpSettingsModal
+          isOpen={showMcpSettings}
+          onClose={() => setShowMcpSettings(false)}
+        />
+      )}
     </div>
   );
 }

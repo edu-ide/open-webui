@@ -8,10 +8,12 @@ import { PageLoading } from './components/common/LoadingSpinner';
 import Sidebar from './components/layout/Sidebar';
 import ChatPage from './pages/ChatPage';
 import AuthPage from './pages/AuthPage';
-import { McpDashboard } from './components/mcp';
-import { CopilotMCPDemo } from './components/copilot/CopilotMCPDemo';
+import { McpMarketplace } from './components/marketplace';
 import { useResponsive } from './hooks/useResponsive';
 import { Bars3Icon } from '@heroicons/react/24/outline';
+import { useMcpServers } from './hooks/useMcp';
+import { McpServerConfig } from './types/mcp';
+import React from 'react';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -33,6 +35,34 @@ const queryClient = new QueryClient({
   },
 });
 
+// MCP 초기화 컴포넌트
+function McpInitializer() {
+  const { servers, addServer } = useMcpServers();
+
+  React.useEffect(() => {
+    // 앱 시작시 기본 MCP 서버가 없으면 추가
+    const hasDefaultServer = servers.some(server => 
+      server.config.name === 'shrimp-task-manager-spring'
+    );
+    
+    if (!hasDefaultServer && servers.length === 0) {
+      const defaultServer: McpServerConfig = {
+        id: 'shrimp-task-manager-default',
+        name: 'shrimp-task-manager-spring',
+        transport: 'sse',
+        endpoint: 'https://mcp-shrimp.ugot.uk/sse',
+        auth: { type: 'none' },
+        options: {}
+      };
+      
+      console.log('Initializing default MCP server:', defaultServer);
+      addServer(defaultServer).catch(console.error);
+    }
+  }, [servers, addServer]);
+
+  return null; // 렌더링할 UI 없음
+}
+
 function AppLayout() {
   const { isMobile, showSidebar, toggleSidebar } = useResponsive();
 
@@ -42,10 +72,10 @@ function AppLayout() {
       <Sidebar />
       
       {/* 메인 콘텐츠 */}
-      <div className="flex flex-1 flex-col overflow-hidden">
+      <div className="flex flex-1 flex-col h-full min-h-0">
         {/* 상단 바 (모바일에서만 표시) */}
         {isMobile && !showSidebar && (
-          <div className="flex items-center justify-between border-b border-gray-200 bg-white px-4 py-3 dark:border-gray-700 dark:bg-gray-900">
+          <div className="flex items-center justify-between border-b border-gray-200 bg-white px-4 py-3 dark:border-gray-700 dark:bg-gray-900 flex-shrink-0">
             <button
               onClick={toggleSidebar}
               className="flex items-center justify-center rounded-md p-2 text-gray-600 transition-colors hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-800"
@@ -60,13 +90,12 @@ function AppLayout() {
         )}
         
         {/* 페이지 콘텐츠 */}
-        <div className="flex-1 overflow-hidden">
+        <div className="flex-1 min-h-0">
           <Routes>
             <Route path="/auth" element={<AuthPage />} />
             <Route path="/" element={<ChatPage />} />
             <Route path="/c/:id" element={<ChatPage />} />
-            <Route path="/mcp" element={<McpDashboard />} />
-            <Route path="/copilot-mcp" element={<CopilotMCPDemo />} />
+            <Route path="/marketplace" element={<McpMarketplace />} />
           </Routes>
         </div>
       </div>
@@ -85,6 +114,7 @@ export function App() {
               <AuthProvider>
                 <ErrorBoundary fallback={<PageLoading label="채팅 서비스를 초기화하는 중..." />}>
                   <ChatProvider>
+                    <McpInitializer />
                     <div className="h-screen bg-white text-gray-900 dark:bg-gray-900 dark:text-gray-100">
                       <AppLayout />
                     </div>

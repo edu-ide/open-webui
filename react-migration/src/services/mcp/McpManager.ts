@@ -47,6 +47,25 @@ export class McpManager extends EventEmitter {
     this.log('info', serverId, `Server removed: ${serverId}`);
   }
 
+  public async updateServer(serverId: string, config: McpServerConfig): Promise<void> {
+    const existingClient = this.clients.get(serverId);
+    if (!existingClient) {
+      throw new Error(`Server ${serverId} not found`);
+    }
+
+    // Disconnect existing client
+    await existingClient.disconnect();
+    existingClient.destroy();
+
+    // Create new client with updated config
+    const newClient = this.createClient(config);
+    this.setupClientListeners(newClient);
+    this.clients.set(serverId, newClient);
+
+    this.emit('serverStateChange', newClient.getState());
+    this.log('info', serverId, `Server updated: ${config.name}`);
+  }
+
   public async connectServer(serverId: string): Promise<void> {
     const client = this.getClient(serverId);
     await client.connect();
@@ -123,7 +142,7 @@ export class McpManager extends EventEmitter {
 
   // Private Methods
   private createClient(config: McpServerConfig): McpClient {
-    switch (config.type) {
+    switch (config.transport) {
       case 'sse':
         return new SseClient(config);
       // TODO: Add support for other client types
@@ -132,7 +151,7 @@ export class McpManager extends EventEmitter {
       // case 'stdio':
       //   return new StdioClient(config);
       default:
-        throw new Error(`Unsupported server type: ${config.type}`);
+        throw new Error(`Unsupported server transport: ${config.transport}`);
     }
   }
 

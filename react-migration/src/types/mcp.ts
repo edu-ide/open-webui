@@ -23,15 +23,37 @@ export interface JsonRpcError {
 
 // MCP Protocol Types
 export type McpServerType = 'sse' | 'stdio' | 'websocket' | 'http';
+export type McpTransportType = 'sse' | 'stdio' | 'websocket';
+
+export interface OAuth2AuthConfig {
+  authorizationEndpoint: string;
+  tokenEndpoint: string;
+  clientId?: string;
+  clientSecret?: string;
+  redirectUri?: string;
+  scope?: string;
+  additionalParameters?: Record<string, string>;
+  // Dynamic Client Registration
+  registrationEndpoint?: string;
+  clientName?: string;
+  // PKCE support
+  usePKCE?: boolean;
+  // Resource Indicators
+  resourceIndicators?: string[];
+}
 
 export interface McpServerConfig {
   id: string;
   name: string;
-  type: McpServerType;
-  url?: string;
-  command?: string;
-  args?: string[];
-  env?: Record<string, string>;
+  transport: McpTransportType;
+  endpoint: string;
+  options?: Record<string, any>;
+  // Authentication
+  auth?: {
+    type?: 'none' | 'bearer' | 'oauth2';
+    token?: string;
+    oauth2?: OAuth2AuthConfig;
+  };
 }
 
 export interface McpCapabilities {

@@ -187,7 +187,7 @@ export default function Sidebar({ className = '' }: SidebarProps) {
               </div>
               <div className="flex flex-col space-y-1">
                 <NavLink
-                  to="/mcp"
+                  to="/marketplace"
                   onClick={handleChatClick}
                   className={({ isActive }) =>
                     `group w-full flex justify-between rounded-lg px-[11px] py-[6px] transition-all duration-200 whitespace-nowrap text-ellipsis ${
@@ -199,24 +199,7 @@ export default function Sidebar({ className = '' }: SidebarProps) {
                 >
                   <div className="flex self-center flex-1 w-full">
                     <div className="text-left self-center overflow-hidden w-full h-[20px] truncate">
-                      MCP Dashboard
-                    </div>
-                  </div>
-                </NavLink>
-                <NavLink
-                  to="/copilot-mcp"
-                  onClick={handleChatClick}
-                  className={({ isActive }) =>
-                    `group w-full flex justify-between rounded-lg px-[11px] py-[6px] transition-all duration-200 whitespace-nowrap text-ellipsis ${
-                      isActive
-                        ? 'bg-gray-200 dark:bg-gray-900'
-                        : 'hover:bg-gray-100 dark:hover:bg-gray-950'
-                    }`
-                  }
-                >
-                  <div className="flex self-center flex-1 w-full">
-                    <div className="text-left self-center overflow-hidden w-full h-[20px] truncate">
-                      CopilotKit + MCP Demo
+                      MCP Marketplace
                     </div>
                   </div>
                 </NavLink>

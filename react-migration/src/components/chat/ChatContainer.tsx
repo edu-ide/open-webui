@@ -70,9 +70,9 @@ export default function ChatContainer({
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        className="h-full overflow-y-auto px-4 py-6"
+        className="h-full overflow-y-auto"
       >
-        <div className="mx-auto max-w-4xl space-y-1">
+        <div className="mx-auto max-w-3xl space-y-4 px-4 py-8">
           {messages.map((message, index) => (
             <ChatMessage
               key={message.id}

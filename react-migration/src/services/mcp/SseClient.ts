@@ -8,7 +8,7 @@ export class SseClient extends McpClient {
 
   constructor(config: McpServerConfig) {
     super(config);
-    if (!config.url) {
+    if (!config.endpoint) {
       throw new Error('SSE client requires a URL');
     }
   }
@@ -43,12 +43,12 @@ export class SseClient extends McpClient {
 
   private async establishConnection(): Promise<void> {
     return new Promise((resolve, reject) => {
-      if (!this.config.url) {
+      if (!this.config.endpoint) {
         reject(new Error('No URL configured'));
         return;
       }
 
-      this.eventSource = new EventSource(this.config.url);
+      this.eventSource = new EventSource(this.config.endpoint);
 
       const connectionTimeout = setTimeout(() => {
         reject(new Error('Connection timeout'));
@@ -57,7 +57,7 @@ export class SseClient extends McpClient {
 
       this.eventSource.onopen = () => {
         clearTimeout(connectionTimeout);
-        console.log(`SSE connection established to ${this.config.url}`);
+        console.log(`SSE connection established to ${this.config.endpoint}`);
         resolve();
       };
 
@@ -114,12 +114,12 @@ export class SseClient extends McpClient {
       return;
     }
 
-    if (!this.config.url) {
+    if (!this.config.endpoint) {
       throw new Error('No URL configured');
     }
 
     // For SSE, we need to send requests via HTTP POST
-    const response = await fetch(this.config.url.replace('/messages', ''), {
+    const response = await fetch(this.config.endpoint.replace('/messages', ''), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
