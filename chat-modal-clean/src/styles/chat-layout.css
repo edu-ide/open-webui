@@ -1,0 +1,45 @@
+/* Chat layout fix for mobile */
+.chat-page-container {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-content-area {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.chat-input-container {
+  position: sticky;
+  bottom: 0;
+  background: white;
+  border-top: 1px solid #e5e7eb;
+  z-index: 10;
+}
+
+.dark .chat-input-container {
+  background: rgb(17, 24, 39);
+  border-top-color: rgb(55, 65, 81);
+}
+
+/* Mobile specific fixes */
+@media (max-width: 768px) {
+  .chat-page-container {
+    height: 100vh;
+    height: 100dvh; /* Dynamic viewport height for mobile */
+  }
+  
+  .chat-input-container {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 50;
+  }
+  
+  .chat-content-area {
+    padding-bottom: 80px; /* Space for fixed input */
+  }
+}
