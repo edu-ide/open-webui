@@ -8,6 +8,7 @@
 import { AIChatService, type ChatMessage, type ChatConversation } from './aiChatService';
 import { mcpHelpers, mcpClient, mcpContexts } from '$lib/stores/mcp';
 import type { MCPContext, MCPStreamChunk, MCPTool } from '$lib/types/mcp';
+import { authService } from './authService';
 import { get } from 'svelte/store';
 
 export interface EnhancedChatMessage extends ChatMessage {
@@ -25,8 +26,9 @@ export class EnhancedAIChatService extends AIChatService {
 	private mcpInitialized = false;
 	private enabledTools = new Set<string>(['web_search', 'calculator', 'datetime', 'memory']);
 
-	constructor(token: string) {
-		super(token);
+	constructor() {
+		// No token needed, OAuth2 handles authentication
+		super('');
 	}
 
 	/**
@@ -34,10 +36,13 @@ export class EnhancedAIChatService extends AIChatService {
 	 */
 	async initialize(): Promise<void> {
 		try {
-			// Initialize MCP client
+			// Get OAuth2 token for MCP
+			const token = await authService.getAccessToken();
+			
+			// Initialize MCP client with OAuth2 token
 			await mcpHelpers.initialize({
 				url: 'wss://ai.ugot.uk/mcp',
-				token: this.token,
+				token: token,
 				reconnect: true,
 				reconnectInterval: 5000,
 				maxReconnectAttempts: 10
@@ -110,12 +115,11 @@ export class EnhancedAIChatService extends AIChatService {
 				enabled_tools: enableTools ? Array.from(this.enabledTools) : []
 			};
 
-			// Send request to AI server
-			const response = await fetch('https://ai.ugot.uk/api/v2/chat', {
+			// Send request to AI server using OAuth2
+			const response = await authService.fetch('https://ai.ugot.uk/api/v2/chat', {
 				method: 'POST',
 				headers: {
-					'Content-Type': 'application/json',
-					'Authorization': `Bearer ${this.token}`
+					'Content-Type': 'application/json'
 				},
 				body: JSON.stringify(request)
 			});
@@ -323,7 +327,7 @@ export class EnhancedAIChatService extends AIChatService {
 			user_agent: navigator.userAgent,
 			timestamp: new Date().toISOString(),
 			page_url: window.location.href,
-			user_id: this.token.substring(0, 8), // Use token prefix as user ID
+			user_id: authService.getUserInfo()?.sub || 'anonymous',
 			session_id: sessionStorage.getItem('session_id') || this.generateSessionId()
 		};
 	}

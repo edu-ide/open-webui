@@ -4,7 +4,7 @@
 	import { toast } from 'svelte-sonner';
 	
 	import { EnhancedAIChatService, type EnhancedChatConversation, type EnhancedChatMessage } from '$lib/services/enhancedAIChatService';
-	import { healthCheck, getModelsStatus } from '$lib/apis/aiserver';
+	import { healthCheck, getModelsStatus } from '$lib/apis/aiserver/enhanced';
 	import { user } from '$lib/stores';
 	import { mcpStatus, mcpToolsList, mcpContextsList, mcpError } from '$lib/stores/mcp';
 	
@@ -50,7 +50,8 @@
 			connectionError = '';
 			
 			// Initialize Enhanced AI Chat Service with MCP
-			aiChatService = new EnhancedAIChatService($user.token);
+			// OAuth2 authentication is handled internally
+			aiChatService = new EnhancedAIChatService();
 			
 			// Initialize MCP connection
 			try {
@@ -64,8 +65,8 @@
 			isConnected = health.status === 'UP';
 			
 			if (isConnected) {
-				// Get model status
-				const status = await getModelsStatus($user.token);
+				// Get model status - enhanced API handles OAuth2 internally
+				const status = await getModelsStatus($user?.token || '');
 				modelStatus.set(status);
 				
 				// Load existing conversations
