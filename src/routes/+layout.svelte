@@ -35,6 +35,8 @@
 
 	import { executeToolServer, getBackendConfig } from '$lib/apis';
 	import { getSessionUser, userSignOut } from '$lib/apis/auths';
+	import { authService } from '$lib/services/authService';
+	import { oauth2Authenticated, oauth2Error } from '$lib/stores/oauth2';
 
 	import '../tailwind.css';
 	import '../app.css';
@@ -72,6 +74,16 @@
 	const BREAKPOINT = 768;
 
 	const setupSocket = async (enableWebsocket) => {
+		// Get OAuth2 token if available, otherwise use localStorage token
+		let authToken = localStorage.token;
+		if ($oauth2Authenticated) {
+			try {
+				authToken = await authService.getAccessToken();
+			} catch (error) {
+				console.error('Failed to get OAuth2 token for socket:', error);
+			}
+		}
+		
 		const _socket = io(`${WEBUI_BASE_URL_NO_PREFIX}` || undefined, {
 			reconnection: true,
 			reconnectionDelay: 1000,
@@ -79,7 +91,7 @@
 			randomizationFactor: 0.5,
 			path: '/ws/socket.io',
 			transports: enableWebsocket ? ['websocket'] : ['polling', 'websocket'],
-			auth: { token: localStorage.token }
+			auth: { token: authToken }
 		});
 
 		await socket.set(_socket);
@@ -579,8 +591,33 @@
 				const currentUrl = `${window.location.pathname}${window.location.search}`;
 				const encodedUrl = encodeURIComponent(currentUrl);
 
-				if (localStorage.token) {
-					// Get Session User Info
+				// Check if user is authenticated via OAuth2
+				const isAuthenticated = await authService.initialize();
+				
+				if (isAuthenticated) {
+					// Get OAuth2 access token for socket auth
+					const accessToken = await authService.getAccessToken();
+					
+					// Use OAuth2 user info
+					const userInfo = authService.getUserInfo();
+					if (userInfo) {
+						// Create session user object compatible with existing system
+						const sessionUser = {
+							id: userInfo.sub,
+							name: userInfo.name || userInfo.preferred_username || userInfo.sub,
+							email: userInfo.email,
+							profile_image_url: userInfo.picture,
+							token: accessToken // For backward compatibility
+						};
+						
+						// Save Session User to Store
+						$socket.emit('user-join', { auth: { token: accessToken } });
+						
+						await user.set(sessionUser);
+						await config.set(await getBackendConfig());
+					}
+				} else if (localStorage.token) {
+					// Fallback to existing token-based auth if OAuth2 not available
 					const sessionUser = await getSessionUser(localStorage.token).catch((error) => {
 						toast.error(`${error}`);
 						return null;
@@ -606,8 +643,8 @@
 				} else {
 					// Don't redirect if we're already on the auth page
 					// Needed because we pass in tokens from OAuth logins via URL fragments
-					if ($page.url.pathname !== '/auth') {
-						await goto(`/auth?redirect=${encodedUrl}`);
+					if (!$page.url.pathname.startsWith('/auth')) {
+						await goto(`/auth/login?redirect=${encodedUrl}`);
 					}
 				}
 			}

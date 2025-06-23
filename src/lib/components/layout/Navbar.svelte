@@ -27,6 +27,7 @@
 	import { stringify } from 'postcss';
 	import PencilSquare from '../icons/PencilSquare.svelte';
 	import Plus from '../icons/Plus.svelte';
+	import { aiChatStoreHelpers } from '$lib/stores/aiChat';
 
 	const i18n = getContext('i18n');
 
@@ -160,6 +161,25 @@
 					>
 						<div class=" m-auto self-center">
 							<PencilSquare className=" size-5" strokeWidth="2" />
+						</div>
+					</button>
+				</Tooltip>
+
+				<Tooltip content="AI Chat">
+					<button
+						id="ai-chat-button"
+						class=" flex {$showSidebar
+							? 'md:hidden'
+							: ''} cursor-pointer px-2 py-2 rounded-xl text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-850 transition"
+						on:click={() => {
+							aiChatStoreHelpers.openModal();
+						}}
+						aria-label="AI Chat"
+					>
+						<div class=" m-auto self-center">
+							<svg class="size-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+								<path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
+							</svg>
 						</div>
 					</button>
 				</Tooltip>
